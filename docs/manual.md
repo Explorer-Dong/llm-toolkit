@@ -27,7 +27,14 @@ graph LR
 
 ## 数据格式转换
 
-我们需要将筛选出来的数据转换为对应 SFT 框架支持的格式。以 LlamaFactory 为例，我们主要将数据转换为其支持的 [ShareGPT](https://llamafactory.readthedocs.io/zh-cn/latest/getting_started/data_preparation.html#id22) 格式：
+我们需要将筛选出来的数据转换为对应 SFT 框架支持的格式。
+
+以 LlamaFactory 为例：
+
+- 我们可以将数据转换为其支持的 [ShareGPT](https://llamafactory.readthedocs.io/zh-cn/latest/getting_started/data_preparation.html#id22)、[OpenAI Chat Completions](https://llamafactory.readthedocs.io/zh-cn/latest/getting_started/data_preparation.html#openai) 等格式并在运行的配置文件中设置对应的 `template` 字段，例如 `template: qwen3_5`。
+- 也可以直接将数据转换为对应模型的 chat_template.jinja 支持的格式，然后弃用 LlamaFactory 的 jinja 文件，即 `template: empty`。
+
+### ShareGPT
 
 ```json
 [
@@ -60,9 +67,30 @@ graph LR
 
 对于多轮对话任务，请参考 [parse_nemotron_v2_swe](../scripts/parse_nemotron_v2_swe.py) 中的代码实现，将一个包含多轮轨迹的训练样本拆分为多个训练样本。之后需要在训练配置文件中设置 `mask_history: true` 避免重复训练。
 
+### OpenAI Chat Completions
+
+```json
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "..."
+    },
+    {
+      "role": "user",
+      "content": "..."
+    },
+    {
+      "role": "assistant",
+      "content": "<think>\n...\n</think>\n\n最终答案"
+    }
+  ]
+}
+```
+
 ## SFT
 
-安装 LlamaFactory：
+### 环境配置
 
 ```bash
 # 安装 py3.12 开发工具包（针对 arm）
@@ -182,7 +210,9 @@ eval_strategy: steps
 eval_steps: 100
 ```
 
-启动微调：
+### 开始训练
+
+启动训练任务：
 
 ```bash
 export HF_HOME=.cache/huggingface
@@ -195,7 +225,7 @@ OMP_NUM_THREADS=4 lmf train examples/train_lora/qwen3.5_lora_sft_nemov2_agentles
 OMP_NUM_THREADS=4 lmf train examples/train_lora/qwen3.5_lora_sft_nemov2_swe.yaml
 ```
 
-## 观察 Loss 曲线
+观察 Loss 曲线：
 
 ```bash
 tensorboard --logdir saves/qwen3.5-35b-a3b/sft/lora/runs/Jul21_17-43-57_gpu-node01-013
@@ -203,43 +233,80 @@ tensorboard --logdir saves/qwen3.5-35b-a3b/sft/lora/runs/Jul21_17-43-57_gpu-node
 
 ## 下游基准测试
 
-### 部署 SFT 后的模型
+如果训练和验证的 Loss 曲线的变化趋势在预期范围内，就可以考虑使用评分基准进一步验证 SFT 的有效性。
 
-全程使用 SGLang 官方 Docker 镜像部署模型，避免所有环境配置。示例配置如下：
+### 权重合并
+
+将 Base 权重和 LoRA 权重合并：
 
 ```bash
+lmf export examples/merge_lora/qwen3.5_lora_sft.yaml
+```
+
+### 模型部署
+
+全程使用 SGLang 官方 Docker 镜像部署模型，避免所有环境配置。
+
+示例配置（路径以及其余参数视本地情况自行修改）：
+
+```bash
+export API_KEY=sk-vincent
+
+# GLM-5.2
+export DOCKER_CONTAINER_NAME=sglang-glm52-fp8
+export MODEL_NAME=GLM-5.2-FP8
+export TOOL_CALL_PARSER=glm47
+export REASONING_PARSER=glm45
+
+# Qwen3.5-35B-A3B
+# export DOCKER_CONTAINER_NAME=sglang-qwen3.5-35b-a3b
+# export MODEL_NAME=Qwen3.5-35B-A3B
+# export TOOL_CALL_PARSER=qwen3_coder
+# export REASONING_PARSER=qwen3
+
 docker run -d \
-  --name sglang-local \
+  --name "$DOCKER_CONTAINER_NAME" \
   --runtime nvidia \
   --gpus '"device=0,1,2,3"' \
   --platform linux/arm64 \
-  -v /cpfs01/llm_team/dwj/data_filter/LlamaFactory/saves/qwen3.5-35b-a3b/sft/lora-0722-szy:/models \
+  -v /cpfs01/llm_team/models:/models \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -p 8000:8000 \
   --ipc=host \
-  lmsysorg/sglang:v0.5.11-cu130 \
+  lmsysorg/sglang:v0.5.15.post1-cu130 \
   sglang serve \
-    --model-path /models/lora_sft_merged \
-    --served-model-name Qwen3.5-35B-A3B-agentless-sft-test \
+    --model-path "/models/$MODEL_NAME" \
+    --served-model-name $MODEL_NAME \
+    --api-key $API_KEY \
     --host 0.0.0.0 \
     --port 8000 \
     --tp-size 4 \
     --allow-auto-truncate \
     --dtype bfloat16 \
     --mem-fraction-static 0.90 \
-    --tool-call-parser qwen3_coder \
-    --reasoning-parser qwen3 \
-    --trust-remote-code
+    --trust-remote-code \
+    --tool-call-parser $TOOL_CALL_PARSER \
+    --reasoning-parser $REASONING_PARSER
 ```
 
-必须要修改的地方有：
+检查推理服务：
 
-- 首个数据挂载 `-v` 后的内容填写为你自己 SFT 后的模型权重路径。
+```bash
+# 检查模型列表
+curl http://127.0.0.1:8000/v1/models -H "Authorization: Bearer $API_KEY" | jq
 
-`sglang serve` 启动参数中：
-
-- `--model-path` 为挂载后的子路径。
-- `--served-model-name` 可自定义。
+# 简单请求
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+       "model": "$MODEL_NAME",
+       "messages": [
+          {"role": "system", "content": "Reply in Chinese."},
+          {"role": "user", "content": "Introduce yourself briefly"}
+        ]
+      }' | jq
+```
 
 ### 启动 SWE-bench Lite 评估
 
