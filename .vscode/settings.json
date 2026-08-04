@@ -1,0 +1,20 @@
+{
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports.ruff": "explicit",
+        }
+    },
+    "outline.showModules": false,
+    "git.autoRepositoryDetection": "subFolders",
+    "git.repositoryScanMaxDepth": 5,
+    "scm.alwaysShowRepositories": true,
+    "ruff.lineLength": 100,
+    "ruff.lint.select": [
+        "F",
+        "E",
+        "W",
+        "UP"
+    ],
+}

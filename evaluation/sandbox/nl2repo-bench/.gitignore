@@ -1,0 +1,14 @@
+# ai
+.claude
+
+# python
+__pycache__/
+.venv
+
+# logs
+logs
+result
+workspaces
+
+# others
+.DS_Store
