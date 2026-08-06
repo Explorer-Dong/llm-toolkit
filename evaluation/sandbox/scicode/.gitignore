@@ -1,3 +1,6 @@
+eval/data/**
+!eval/data/*.txt
+
 # Project specific ignores
 keys.cfg
 **/test_result/**
