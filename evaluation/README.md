@@ -80,7 +80,7 @@ python src/main.py \
 
 ### NL2Repo
 
-作为独立项目维护在子目录下，移步 [sandbox/nl2repo-bench/README.md](sandbox/nl2repo-bench/README.md) 作进一步了解。
+作为独立项目维护在子目录下，移步 [sandbox/nl2repo/README.md](sandbox/nl2repo/README.md) 作进一步了解。
 
 ### SciCode
 

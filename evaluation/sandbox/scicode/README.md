@@ -21,8 +21,8 @@ gdown https://drive.google.com/file/d/17G_k65N_6yFFZ2O-jQH00Lh6iaw3z-AW/view?usp
 cd eval/inspect_ai
 
 inspect eval scicode.py \
-  --model sglang/Qwen3.5-35B-A3B-scicode-2 \
-  --model-base-url http://10.0.3.41:8000/v1 \
+  --model vllm/BigBang-v1 \
+  --model-base-url http://127.0.0.1:8000/v1 \
   --temperature 1.0 \
   --max-connections 8 \
   --top-p 0.95 \

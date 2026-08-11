@@ -1,6 +1,6 @@
 # LLM Serving
 
-LLM 推理依赖复杂的环境，这里选择直接基于 Docker 容器进行，避免所有环境配置。
+LLM 推理依赖复杂的环境，这里选择直接基于 Docker/Podman 容器进行，避免所有环境配置。
 
 ## vLLM
 
@@ -8,23 +8,47 @@ LLM 推理依赖复杂的环境，这里选择直接基于 Docker 容器进行�
 
 ```bash
 export API_KEY=sk-vincent
-export MODEL_NAME=MiniMind3
+export MODEL_NAME=BigBang-v1
 
 docker run -d \
-  --name minimind3 \
+  --name bigbang-v1 \
   --runtime nvidia \
-  --gpus '"device=0,1"' \
-  -v /cpfs01/llm_team/dwj/.cache/huggingface:/root/.cache/huggingface \
-  -v /cpfs01/llm_team/dwj/llm-mini/saves:/models \
+  --gpus '"device=4,5,6,7"' \
+  -v /kwkj-k8s/llm_team/dwj/models:/models \
   -p 8000:8000 \
   --ipc=host \
   vllm/vllm-openai:latest \
-  --model /models/minimind-3 \
-  --served-model-name $MODEL_NAME \
-  --api-key $API_KEY \
-  --tensor-parallel-size 2 \
-  --gpu-memory-utilization 0.90 \
-  --trust-remote-code
+    --model /models/BigBang-v1 \
+    --served-model-name $MODEL_NAME \
+    --api-key $API_KEY \
+    --tensor-parallel-size 4 \
+    --gpu-memory-utilization 0.90 \
+    --trust-remote-code \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3
+```
+
+```bash
+export API_KEY=sk-vincent
+export MODEL_NAME=BigBang-v1
+
+podman run -d \
+  --name bigbang-v1 \
+  --runtime=/usr/bin/nvidia-container-runtime \
+  -e NVIDIA_VISIBLE_DEVICES=nvidia.com/gpu=4,nvidia.com/gpu=5,nvidia.com/gpu=6,nvidia.com/gpu=7 \
+  --security-opt=label=disable \
+  -v /kwkj-k8s/llm_team/dwj/models:/models \
+  -p 8000:8000 \
+  --ipc=host \
+  docker.io/vllm/vllm-openai:latest \
+    --model /models/BigBang-v1 \
+    --served-model-name "$MODEL_NAME" \
+    --api-key "$API_KEY" \
+    --tensor-parallel-size 4 \
+    --gpu-memory-utilization 0.90 \
+    --trust-remote-code \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3
 ```
 
 ## SGLang
@@ -83,6 +107,29 @@ docker run -d \
     --reasoning-parser $REASONING_PARSER
 ```
 
+```bash
+export API_KEY=sk-vincent
+export MODEL_NAME=BigBang-v1
+
+podman run -d \
+  --name bigbang-v1 \
+  --runtime=/usr/bin/nvidia-container-runtime \
+  -e NVIDIA_VISIBLE_DEVICES=nvidia.com/gpu=4,nvidia.com/gpu=5,nvidia.com/gpu=6,nvidia.com/gpu=7 \
+  --security-opt=label=disable \
+  -v /kwkj-k8s/llm_team/dwj/models:/models \
+  -p 8000:8000 \
+  --ipc=host \
+  docker.io/lmsysorg/sglang:v0.5.15 \
+    --model /models/BigBang-v1 \
+    --served-model-name "$MODEL_NAME" \
+    --api-key "$API_KEY" \
+    --tensor-parallel-size 4 \
+    --gpu-memory-utilization 0.90 \
+    --trust-remote-code \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3
+```
+
 ## 检查推理服务
 
 ```bash
@@ -95,7 +142,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-       "model": "$MODEL_NAME",
+       "model": "'$MODEL_NAME'",
        "messages": [
           {"role": "system", "content": "Reply in Chinese."},
           {"role": "user", "content": "Introduce yourself briefly"}
