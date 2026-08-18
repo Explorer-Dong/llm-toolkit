@@ -1,6 +1,6 @@
 # LLM Serving
 
-LLM 推理依赖复杂的环境，这里选择直接基于 Docker/Podman 容器进行，避免所有环境配置。
+LLM 推理依赖复杂的环境，这里选择直接基于 Docker 容器进行，避免所有环境配置。
 
 ## vLLM
 
@@ -12,7 +12,6 @@ export MODEL_NAME=BigBang-v1
 
 docker run -d \
   --name bigbang-v1 \
-  --runtime nvidia \
   --gpus '"device=4,5,6,7"' \
   -v /kwkj-k8s/llm_team/dwj/models:/models \
   -p 8000:8000 \
@@ -28,29 +27,6 @@ docker run -d \
     --reasoning-parser qwen3
 ```
 
-```bash
-export API_KEY=sk-vincent
-export MODEL_NAME=BigBang-v1
-
-podman run -d \
-  --name bigbang-v1 \
-  --runtime=/usr/bin/nvidia-container-runtime \
-  -e NVIDIA_VISIBLE_DEVICES=nvidia.com/gpu=4,nvidia.com/gpu=5,nvidia.com/gpu=6,nvidia.com/gpu=7 \
-  --security-opt=label=disable \
-  -v /kwkj-k8s/llm_team/dwj/models:/models \
-  -p 8000:8000 \
-  --ipc=host \
-  docker.io/vllm/vllm-openai:latest \
-    --model /models/BigBang-v1 \
-    --served-model-name "$MODEL_NAME" \
-    --api-key "$API_KEY" \
-    --tensor-parallel-size 4 \
-    --gpu-memory-utilization 0.90 \
-    --trust-remote-code \
-    --tool-call-parser qwen3_coder \
-    --reasoning-parser qwen3
-```
-
 ## SGLang
 
 示例配置（路径以及其余参数视本地情况自行修改）：
@@ -58,40 +34,22 @@ podman run -d \
 ```bash
 export API_KEY=sk-vincent
 
-# GLM-5.2
-# export MODEL_PATH=/cpfs01/llm_team/models
-# export MODEL_FOLDER=GLM-5.2-FP8
-# export DOCKER_CONTAINER_NAME=sglang-glm52-fp8
-# export MODEL_NAME=GLM-5.2-FP8
-# export TOOL_CALL_PARSER=glm47
-# export REASONING_PARSER=glm45
-
-# Qwen3.5-35B-A3B
-# export MODEL_PATH=/cpfs01/llm_team/models
-# export MODEL_FOLDER=Qwen3.5-35B-A3B
-# export DOCKER_CONTAINER_NAME=sglang-qwen3.5-35b-a3b
-# export MODEL_NAME=Qwen3.5-35B-A3B
-# export TOOL_CALL_PARSER=qwen3_coder
-# export REASONING_PARSER=qwen3
-
-# Qwen3.5-35B-A3B (SFT)
-export MODEL_PATH=/cpfs01/llm_team/dwj/data_filter/LlamaFactory/saves/qwen3.5-35b-a3b/sft/lora-0729-scicode-2
-export MODEL_FOLDER=lora_sft_merged
-export DOCKER_CONTAINER_NAME=sglang-qwen-scicode
-export MODEL_NAME=Qwen3.5-35B-A3B-scicode-2
+# Qwen3.5
+export MODEL_PATH=/kwkj-k8s/llm_team/dwj/my-llm-toolkit/_models
+export MODEL_FOLDER=KAT-Coder-V2.5-Dev
+export DOCKER_CONTAINER_NAME=sglang-kat-coder-v2.5-dev
+export MODEL_NAME=KAT-Coder-V2.5-Dev
 export TOOL_CALL_PARSER=qwen3_coder
 export REASONING_PARSER=qwen3
 
 docker run -d \
   --name "$DOCKER_CONTAINER_NAME" \
-  --runtime nvidia \
-  --gpus '"device=0,1,2,3"' \
-  --platform linux/arm64 \
+  --gpus '"device=4,5,6,7"' \
   -v $MODEL_PATH:/models \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -p 8000:8000 \
   --ipc=host \
-  lmsysorg/sglang:v0.5.15.post1-cu130 \
+  lmsysorg/sglang:v0.5.16 \
   sglang serve \
     --model-path "/models/$MODEL_FOLDER" \
     --served-model-name $MODEL_NAME \
@@ -105,29 +63,6 @@ docker run -d \
     --trust-remote-code \
     --tool-call-parser $TOOL_CALL_PARSER \
     --reasoning-parser $REASONING_PARSER
-```
-
-```bash
-export API_KEY=sk-vincent
-export MODEL_NAME=BigBang-v1
-
-podman run -d \
-  --name bigbang-v1 \
-  --runtime=/usr/bin/nvidia-container-runtime \
-  -e NVIDIA_VISIBLE_DEVICES=nvidia.com/gpu=4,nvidia.com/gpu=5,nvidia.com/gpu=6,nvidia.com/gpu=7 \
-  --security-opt=label=disable \
-  -v /kwkj-k8s/llm_team/dwj/models:/models \
-  -p 8000:8000 \
-  --ipc=host \
-  docker.io/lmsysorg/sglang:v0.5.15 \
-    --model /models/BigBang-v1 \
-    --served-model-name "$MODEL_NAME" \
-    --api-key "$API_KEY" \
-    --tensor-parallel-size 4 \
-    --gpu-memory-utilization 0.90 \
-    --trust-remote-code \
-    --tool-call-parser qwen3_coder \
-    --reasoning-parser qwen3
 ```
 
 ## 检查推理服务
