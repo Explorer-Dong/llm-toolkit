@@ -1,6 +1,9 @@
 # demo projects
-_demos
+_demos/**
+!_demos/*.md
 # docker images
-_images
+_images/**
+!_images/*.md
 # model weights
-_models
+_models/**
+!_models/*.md

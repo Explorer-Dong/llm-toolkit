@@ -1,47 +1,42 @@
 # LLM Serving
 
-LLM 推理依赖复杂的环境，这里选择直接基于 Docker 容器进行，避免所有环境配置。
+We serve models with vLLM / SGLang in Docker.
 
-## vLLM
-
-示例配置（路径以及其余参数视本地情况自行修改）：
+## Start server
 
 ```bash
 export API_KEY=sk-vincent
-export MODEL_NAME=BigBang-v1
+export MODEL_PATH=/kwkj-k8s/llm_team/ztj/MULTI_DISTILL_8.10/MOPD_GOPD/eval/models
+export MODEL_FOLDER=hybrid_tp8_sp4_40k_moe2048_sync_step103
+export DOCKER_CONTAINER_NAME=local-hybrid_tp8_sp4_40k_moe2048_sync_step103
+export MODEL_NAME=hybrid_tp8_sp4_40k_moe2048_sync_step103
+export TOOL_CALL_PARSER=qwen3_coder
+export REASONING_PARSER=qwen3
+```
 
+vLLM:
+
+```bash
 docker run -d \
-  --name bigbang-v1 \
+  --name "$DOCKER_CONTAINER_NAME" \
   --gpus '"device=4,5,6,7"' \
-  -v /kwkj-k8s/llm_team/dwj/models:/models \
+  -v $MODEL_PATH:/models \
   -p 8000:8000 \
   --ipc=host \
   vllm/vllm-openai:latest \
-    --model /models/BigBang-v1 \
+    --model /models/$MODEL_FOLDER \
     --served-model-name $MODEL_NAME \
     --api-key $API_KEY \
     --tensor-parallel-size 4 \
     --gpu-memory-utilization 0.90 \
     --trust-remote-code \
-    --tool-call-parser qwen3_coder \
-    --reasoning-parser qwen3
+    --tool-call-parser $TOOL_CALL_PARSER \
+    --reasoning-parser $REASONING_PARSER
 ```
 
-## SGLang
-
-示例配置（路径以及其余参数视本地情况自行修改）：
+SGLang:
 
 ```bash
-export API_KEY=sk-vincent
-
-# Qwen3.5
-export MODEL_PATH=/kwkj-k8s/llm_team/dwj/my-llm-toolkit/_models
-export MODEL_FOLDER=KAT-Coder-V2.5-Dev
-export DOCKER_CONTAINER_NAME=sglang-kat-coder-v2.5-dev
-export MODEL_NAME=KAT-Coder-V2.5-Dev
-export TOOL_CALL_PARSER=qwen3_coder
-export REASONING_PARSER=qwen3
-
 docker run -d \
   --name "$DOCKER_CONTAINER_NAME" \
   --gpus '"device=4,5,6,7"' \
@@ -51,7 +46,7 @@ docker run -d \
   --ipc=host \
   lmsysorg/sglang:v0.5.16 \
   sglang serve \
-    --model-path "/models/$MODEL_FOLDER" \
+    --model-path /models/$MODEL_FOLDER \
     --served-model-name $MODEL_NAME \
     --api-key $API_KEY \
     --host 0.0.0.0 \
@@ -65,14 +60,14 @@ docker run -d \
     --reasoning-parser $REASONING_PARSER
 ```
 
-## 检查推理服务
+## Check server
 
 ```bash
-# 检查模型列表
+# check model list
 curl http://127.0.0.1:8000/v1/models \
   -H "Authorization: Bearer $API_KEY" | jq
 
-# 简单请求
+# check simple request
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
