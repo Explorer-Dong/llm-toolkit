@@ -1,12 +1,14 @@
-# VERL 环境复现
+# VERL reproduction manual
 
-配置 [VERL](https://verl.readthedocs.io/en/latest/index.html) 开发框架：
+We use [VERL](https://github.com/verl-project/verl) to **easily** train models with reinforcement learning algorithms.
+
+## Preparation
 
 ```bash
-# 拉取基础开发环境
+# pull VERL's basic developing environment
 docker pull verlai/verl:sgl0512.dev4
 
-# 挂载数据并启动容器
+# bind your workspace and start docker container
 docker run -d \
   --name verl-dev \
   --gpus '"device=4,5,6,7"' \
@@ -19,18 +21,19 @@ docker run -d \
   verlai/verl:sgl0512.dev4 \
   sleep infinity
 
-# 进入开发容器
+# enter the container
 docker exec -it verl-dev bash
 
-# 安装 VERL 源码
+# start your work
+# 1. setup VERL package
 git clone https://github.com/verl-project/verl && cd verl
-# Optional: 根据实际项目回退到指定 VERL 版本
+# (Optional) reset to the target VERL version depend on your project
 # git reset <commit_id>
+# 2. install VERL
 pip3 install --no-deps -e .
+# 3. build your algorithm framework based on VERL
+# from verl import ...
 
-# 在自己的工作区基于 VERL 框架编写 pipeline
-# ...
-
-# 退出开发容器
+# exit the dev container
 exit
 ```

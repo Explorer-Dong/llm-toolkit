@@ -1,6 +1,6 @@
-# Minimind reproduction manual
+# MiniMind reproduction manual
 
-Develop a large language model from scratch.
+We use [MiniMind](https://github.com/jingyaogong/minimind) to **easily** develop a large language model from scratch.
 
 ## Preparation
 
@@ -22,6 +22,18 @@ hf download jingyaogong/minimind_dataset --repo-type=dataset --local-dir ./datas
 
 # ms
 modelscope download --dataset gongjy/minimind_dataset --local_dir ./dataset/ --include "*.jsonl"
+```
+
+### Pre-trained models
+
+If you need pre-trained model weights, run:
+
+```bash
+# hf
+hf download explorer-dong/minimind-v3-out --local-dir ./out
+
+# ms
+modelscope download --model dwj601/minimind-v3-out --local_dir ./out
 ```
 
 ### Reward model

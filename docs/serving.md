@@ -6,10 +6,10 @@ We serve models with vLLM / SGLang in Docker.
 
 ```bash
 export API_KEY=sk-vincent
-export MODEL_PATH=/kwkj-k8s/llm_team/ztj/MULTI_DISTILL_8.10/MOPD_GOPD/eval/models
-export MODEL_FOLDER=hybrid_tp8_sp4_40k_moe2048_sync_step103
-export DOCKER_CONTAINER_NAME=local-hybrid_tp8_sp4_40k_moe2048_sync_step103
-export MODEL_NAME=hybrid_tp8_sp4_40k_moe2048_sync_step103
+export MODEL_PATH=/path/to/models
+export MODEL_FOLDER=Qwen3.8-27B
+export DOCKER_CONTAINER_NAME=local-qwen3.8-27b
+export MODEL_NAME=Qwen3.8-27B
 export TOOL_CALL_PARSER=qwen3_coder
 export REASONING_PARSER=qwen3
 ```

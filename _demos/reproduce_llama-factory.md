@@ -1,75 +1,75 @@
-# LlamaFactory 复现手册
+# LlamaFactory reproduction manual
 
-克隆代码：
+We use [LlamaFactory](https://github.com/hiyouga/LlamaFactory) to **easily** fine-tune models.
+
+## Preparation
 
 ```bash
-git clone https://github.com/hiyouga/LlamaFactory.git llama-factory
+git clone --depth 1 https://github.com/hiyouga/LlamaFactory.git llama-factory
 cd llama-factory
-```
 
-安装依赖：
-
-```bash
 uv venv .venv --python 3.13
 source .venv/bin/activate
 uv pip install -e .
 uv pip install -r requirements/metrics.txt
 uv pip install tensorboard
 
-# (Optional) 安装 DeepSpeed 减小显存占用
-# 若要启用，需要在配置文件中添加 deepspeed: examples/deepspeed/ds_z3_config.json
+# (Optional) Install DeepSpeed to decrease HBM usage
+# (add to yaml) deepspeed: examples/deepspeed/ds_z3_config.json
 uv pip install -r requirements/deepspeed.txt
 
-# (Optional) 安装 FA2 加速训推
-# 若要启用，需要在配置文件中添加 flash_attn: fa2
+# (Optional) Install FA2 to accelerate training and inference
+# (add to yaml) flash_attn: fa2
 uv pip install packaging psutil ninja
 MAX_JOBS=4 uv pip install flash-attn --no-build-isolation -v
 
-# (Optional) 安装 Liger 加速训练
-# 若要启用，需要在配置文件中添加 enable_liger_kernel: true
+# (Optional) Install Liger to accelerate training
+# (add to yaml) enable_liger_kernel: true
 uv pip install liger-kernel
 ```
 
-数据管线：
+## Data
 
-- 我们可以将数据转换为其支持的 [ShareGPT](https://llamafactory.readthedocs.io/zh-cn/latest/getting_started/data_preparation.html#id22)、[OpenAI Chat Completions](https://llamafactory.readthedocs.io/zh-cn/latest/getting_started/data_preparation.html#openai) 等格式并在运行的配置文件中设置对应的 `template` 字段，例如 `template: qwen3_5`。
-- 也可以直接将数据转换为对应模型的 chat_template.jinja 支持的格式，然后弃用 LlamaFactory 的 jinja 文件，即 `template: empty`。
+```mermaid
+graph LR
+  raw(Raw Data)
+  msg(Messages)
+  final_data(Templated Messages)
+  raw -->|Reformat| msg -->|Apply official chat template| final_data
+```
 
-数据配置：
+I recommend apply official chat template on [Messages](https://llamafactory.readthedocs.io/en/latest/getting_started/data_preparation.html#openai) by ourself and serve checkpoints with high performance engines such as vLLM and SGLang.
 
-将转换后的 json 数据存储到 `LlamaFactory/data` 路径下，然后在 `LlamaFactory/data/dataset_info.json` 注册你的数据集。例如：
+Then add `template: empty` field to your training config yaml file.
+
+Finally, register the dataset info in `data/dataset_info.json`. For example:
 
 ```json
-{
-  "nemotron_sft_swe_v2_agentless": {
-    "file_name": "nemotron_sft_swe_v2_agentless.json",
-    "formatting": "sharegpt",
-    "columns": {
-      "messages": "conversations"
-    }
-  },
-  "nemotron_sft_swe_v2_swe_turns": {
-    "file_name": "nemotron_sft_swe_v2_swe_turns.json",
-    "formatting": "sharegpt",
-    "columns": {
-      "messages": "conversations",
-      "system": "system",
-      "tools": "tools"
-    }
+"nemotron_sft_swe_v2_swe_turns": {
+  "file_name": "nemotron_sft_swe_v2_swe_turns.json",
+  "formatting": "sharegpt",
+  "columns": {
+    "messages": "conversations",
+    "system": "system",
+    "tools": "tools"
   }
 }
 ```
 
-训练配置：
+## Train
 
-示例配置如下，参数含义详见 [LlamaFactory Docs](https://llamafactory.readthedocs.io/zh-cn/latest/advanced/arguments.html)，这里给一些基本的解释：
-
-- 如果 `enable_thinking: false`，需要给 `template` 配置项添加 `_nothink` 后缀
-- 参考 [statis_nemotron_v2](../scripts/statis_nemotron_v2.py) 的实现统计数据集的数据分布，选择合适的 `cutoff_len`
+Start training:
 
 ```bash
+OMP_NUM_THREADS=4 \
+  lmf train examples/train_lora/qwen3.5_lora_sft_nemov2_swe.yaml
+```
+
+Example [training setup](https://llamafactory.readthedocs.io/en/latest/advanced/arguments.html):
+
+```yaml
 ### model
-model_name_or_path: /cpfs01/llm_team/models/Qwen3.5-35B-A3B
+model_name_or_path: /path/to/models/Qwen3.5-35B-A3B
 trust_remote_code: true
 
 ### method
@@ -85,7 +85,7 @@ deepspeed: examples/deepspeed/ds_z3_config.json
 
 ### dataset
 dataset: nemotron_sft_swe_v2_agentless
-template: qwen3_5
+template: empty
 enable_thinking: true
 cutoff_len: 32768
 max_samples: 10000
@@ -93,7 +93,7 @@ preprocessing_num_workers: 16
 dataloader_num_workers: 4
 
 ### output
-output_dir: saves/qwen3.5-35b-a3b/sft/lora-0723-agentless
+output_dir: saves/qwen3.5-35b-a3b/sft/lora
 logging_steps: 10
 save_steps: 100
 plot_loss: true
@@ -121,36 +121,24 @@ eval_strategy: steps
 eval_steps: 100
 ```
 
-启动训练任务：
+## Monitor
 
-```bash
-cd LlamaFactory
-export HF_HOME=../.cache/huggingface
-
-# 在 Agentless 数据上微调
-OMP_NUM_THREADS=4 lmf train examples/train_lora/qwen3.5_lora_sft_nemov2_agentless.yaml
-
-# 在 SWE 数据上微调
-OMP_NUM_THREADS=4 lmf train examples/train_lora/qwen3.5_lora_sft_nemov2_swe.yaml
-
-# 在 SciCode trajectories (GLM-5.2) 数据上微调
-OMP_NUM_THREADS=4 lmf train examples/train_lora/qwen3.5_lora_sft_scicode-trajectories.yaml
-```
-
-观察 Loss 曲线：
+We can monitor the loss curve with `tensorboard`:
 
 ```bash
 tensorboard --logdir saves/qwen3.5-35b-a3b/sft/lora/runs/Jul21_17-43-57_gpu-node01-013
 ```
 
-如果训练和验证的 Loss 曲线的变化趋势在预期范围内，就可以考虑使用评分基准进一步验证 SFT 的有效性。
+## Evaluate
 
-将 Base 权重和 LoRA 权重合并：
+After fine-tuning, we need to evaluate the model.
+
+If you fine-tune model with LoRA method, you need to merge model weitghs between base and LoRA:
 
 ```bash
 lmf export examples/merge_lora/qwen3.5_lora_sft.yaml
 ```
 
-接着使用推理引擎部署合并后的模型，详情见 [LLM Serving](../../serving/README.md) 的说明。
+Then serve model with inference engine, such as vLLM, SGLang and so on.
 
-然后将本地启动的端点接入各种评测框架即可。
+Finally, you can call the model API endpoint to evaluate **your** model.
