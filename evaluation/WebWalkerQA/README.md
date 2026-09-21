@@ -51,8 +51,8 @@ uv run methods.py \
 ```bash
 cd src
 uv run judge.py \
-  --input_path ../results/react_qwen2.5-7b.jsonl \
-  --output_path ../results/react_qwen2.5-7b_judge_gpt-4o.jsonl
+  --input_path ../results/react_agent_qwen2.5-7b.jsonl \
+  --output_path ../results/react_agent_qwen2.5-7b_judge_gpt-4o.jsonl
 ```
 
 判分结果追加写入 output_path（可中断续跑），汇总报告在同名 `_report.json`。

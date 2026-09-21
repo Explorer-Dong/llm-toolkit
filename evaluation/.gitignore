@@ -1,12 +1,10 @@
-# ai
-.claude
-
-data
-outputs
-
 # python
 __pycache__
 .venv
 uv.lock
 *.egg-info
-webwalkerqa
+
+# others
+.env
+data
+outputs
