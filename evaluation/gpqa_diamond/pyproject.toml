@@ -1,14 +1,12 @@
 [project]
-name = "llm-evaluation"
-version = "0.0.1"
-description = "LLM evalution toolkit."
+name = "gpqa-diamond-bench"
+version = "0.1.0"
+description = "GPQA-Diamond multiple-choice benchmark."
 requires-python = ">=3.12"
 dependencies = [
     "openai",
     "datasets",
-    "pydantic",
     "tqdm",
-    "rich",
 ]
 
 [tool.uv]

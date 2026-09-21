@@ -1,0 +1,13 @@
+[project]
+name = "aime26-bench"
+version = "0.1.0"
+description = "AIME 2026 math benchmark."
+requires-python = ">=3.12"
+dependencies = [
+    "openai",
+    "datasets",
+    "tqdm",
+]
+
+[tool.uv]
+package = false
