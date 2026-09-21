@@ -1,0 +1,23 @@
+{
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports.ruff": "explicit",
+        }
+    },
+    "outline.showModules": false,
+    "ruff.lineLength": 120,
+    "ruff.lint.select": [
+        "F",
+        "E",
+        "W",
+        "UP"
+    ],
+    "ruff.lint.ignore": [
+        "UP045",
+        "UP006",
+        "UP035",
+        "UP007"
+    ]
+}

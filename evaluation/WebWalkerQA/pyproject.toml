@@ -1,0 +1,25 @@
+[project]
+name = "webwalkerqa-bench"
+version = "0.1.0"
+description = "WebWalkerQA benchmark: WebWalker / ReAct / Reflexion + LLM-as-a-judge."
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    # crawl4ai >= 0.5 changed result.markdown to a non-str object
+    "crawl4ai==0.4.248",
+    # qwen-agent imports soundfile but does not declare it
+    "qwen-agent==0.0.19",
+    "soundfile",
+    # openai >= 2 / langchain >= 1 break qwen-agent 0.0.19 and evaluate.py
+    "openai<2",
+    "langchain==0.3.20",
+    "langchain-openai==0.3.33",
+    "beautifulsoup4",
+    "datasets",
+    "json5",
+    "python-dotenv",
+    "requests",
+    "tqdm",
+]
+
+[tool.uv]
+package = false
