@@ -1,9 +1,10 @@
 # demo projects
-_demos/**
-!_demos/*.md
-# docker images
-_images/**
-!_images/*.md
+demos/**
+!demos/*.md
+
 # model weights
-_models/**
-!_models/*.md
+models/**
+!models/*.md
+
+# python
+.venv
