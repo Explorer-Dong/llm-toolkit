@@ -32,7 +32,7 @@ Final output format:
 
 
 class ModelUtils:
-    """Parse completion text into the integer answer."""
+    """Utils for model during interaction."""
 
     @staticmethod
     def last_json_object(text: str) -> dict[str, Any] | None:
@@ -65,19 +65,24 @@ class ModelUtils:
         return int(matches[-1]) if matches else None
 
     @staticmethod
-    async def call_model(request_sem: asyncio.Semaphore, client: AsyncOpenAI, request: dict[str, Any]) -> str:
+    async def call_model(
+        request_sem: asyncio.Semaphore, client: AsyncOpenAI, request: dict[str, Any]
+    ) -> tuple[str, str | None]:
         async with request_sem:
             stream = await client.chat.completions.create(**request)
             parts: list[str] = []
+            finish_reason: str | None = None
             try:
                 async for chunk in stream:
                     for choice in chunk.choices or ():
                         content = getattr(choice.delta, "content", None)
                         if content:
                             parts.append(content)
+                        if choice.finish_reason:
+                            finish_reason = choice.finish_reason
             finally:
                 await stream.close()
-            return "".join(parts)
+            return "".join(parts), finish_reason
 
 
 class EvalUtil:
@@ -130,7 +135,9 @@ class EvalUtil:
         client = AsyncOpenAI(api_key=args.api_key, base_url=args.base_url, timeout=args.timeout, max_retries=3)
         request_sem = asyncio.Semaphore(args.concurrency)
         records: list[dict[str, Any]] = []
-        pending = [asyncio.create_task(EvalUtil._run_helper(task, client, args.model, request_sem, args)) for task in tasks]
+        pending = [
+            asyncio.create_task(EvalUtil._run_helper(task, client, args.model, request_sem, args)) for task in tasks
+        ]
         try:
             with tqdm(total=len(pending), desc=f"AIME{args.year}", unit="task") as progress:
                 for future in asyncio.as_completed(pending):
@@ -159,8 +166,9 @@ class EvalUtil:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": task["problem"]},
         ]
-        error: str | None = None
+        sys_error: str | None = None
         output: str | None = None
+        finish_reason: str | None = None
         started = time.perf_counter()
 
         request: dict[str, Any] = {
@@ -177,24 +185,23 @@ class EvalUtil:
             request["seed"] = args.seed
 
         try:
-            output = (await ModelUtils.call_model(request_sem, client, request)).strip()
+            output, finish_reason = await ModelUtils.call_model(request_sem, client, request)
+            output = output.strip()
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+            sys_error = f"{type(exc).__name__}: {exc}"
 
-        if not error:
-            correct = EvalUtil._rubric(output, task["gold"])
-        else:
-            correct = False
+        correct = EvalUtil._rubric(output, task["gold"]) if not sys_error else False
         return {
             "id": task["id"],
             "problem": task["problem"],
             "gold": task["gold"],
             "prediction": ModelUtils.parse_answer(output or ""),
             "output": output,
+            "finish_reason": finish_reason,
             "correct": correct,
             "score": int(correct),
             "latency_sec": round(time.perf_counter() - started, 3),
-            "error": error,
+            "sys_error": sys_error,
         }
 
     @staticmethod
@@ -214,7 +221,7 @@ class EvalUtil:
             "num_tasks": len(records),
             "correct": sum(record["score"] for record in records),
             "score": sum(record["score"] for record in records) / len(records) if records else 0.0,
-            "errors": sum(record["error"] is not None for record in records),
+            "sys_errors": sum(record["sys_error"] is not None for record in records),
             "output": str(output_path),
         }
 

@@ -1,12 +1,19 @@
 [project]
 name = "gpqa-diamond-bench"
 version = "0.1.0"
-description = "GPQA-Diamond multiple-choice benchmark."
-requires-python = ">=3.12"
+description = "One-shot harness for the GPQA-Diamond multiple-choice benchmark."
+readme = "README.md"
+requires-python = ">=3.11"
 dependencies = [
-    "openai",
-    "datasets",
-    "tqdm",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16",
+    "ty>=0.0.84",
 ]
 
 [tool.uv]

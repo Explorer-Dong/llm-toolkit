@@ -2,11 +2,11 @@
 
 ## One-shot benchmark
 
-AIME 子文件夹下的代码风格与文件组织是最符合我开发习惯的 One-shot 评测代码。所有 One-shot 类型的 benchmark 在复现时需要借鉴其实现。
+The code style and file organization within the AIME subfolder represent the "one-shot" evaluation code that best aligns with my development habits. The implementation of this code should serve as a reference when reproducing any one-shot benchmarks.
 
 ## Agentic benchmark
 
-基本代码风格与 One-shot benchmark 一致，额外部分包括但不限于：
+The basic code style aligns with the One-shot benchmark; additional requirements include, but are not limited to:
 
-- 所有的网络请求都需要有指数退让时间的重试机制。
-- 工具调用逻辑作为函数参数传入而非提示词约束。
+- All network requests must implement a retry mechanism with exponential backoff.
+- Function calling must be passed as function arguments rather than enforced through prompt constraints.

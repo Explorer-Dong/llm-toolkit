@@ -6,7 +6,3 @@ uv.lock
 
 docs/_*.md
 outputs
-
-# tmp
-NL2Repo
-SciCode
