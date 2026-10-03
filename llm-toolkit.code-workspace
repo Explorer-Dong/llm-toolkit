@@ -21,14 +21,6 @@
       "path": "evaluation/GPQA-Diamond"
     },
     {
-      "name": "NL2Repo",
-      "path": "evaluation/NL2Repo"
-    },
-    {
-      "name": "SciCode",
-      "path": "evaluation/SciCode"
-    },
-    {
       "name": "WebWalkerQA",
       "path": "evaluation/WebWalkerQA"
     }
