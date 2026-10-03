@@ -1,0 +1,58 @@
+{
+  "folders": [
+    {
+      "name": "llm-toolkit",
+      "path": "."
+    },
+    {
+      "name": "AIME",
+      "path": "evaluation/AIME"
+    },
+    {
+      "name": "BrowseComp",
+      "path": "evaluation/BrowseComp"
+    },
+    {
+      "name": "GAIA",
+      "path": "evaluation/GAIA"
+    },
+    {
+      "name": "GPQA-Diamond",
+      "path": "evaluation/GPQA-Diamond"
+    },
+    {
+      "name": "NL2Repo",
+      "path": "evaluation/NL2Repo"
+    },
+    {
+      "name": "SciCode",
+      "path": "evaluation/SciCode"
+    },
+    {
+      "name": "WebWalkerQA",
+      "path": "evaluation/WebWalkerQA"
+    }
+  ],
+  "settings": {
+    "[python]": {
+      "editor.defaultFormatter": "charliermarsh.ruff",
+      "editor.formatOnSave": true,
+      "editor.codeActionsOnSave": {
+        "source.organizeImports.ruff": "explicit"
+      }
+    },
+    "ruff.lineLength": 150,
+    "ruff.lint.select": [
+      "F",
+      "E",
+      "W",
+      "UP"
+    ],
+    "ruff.lint.ignore": [
+      "UP045",
+      "UP006",
+      "UP035",
+      "UP007"
+    ]
+  }
+}
