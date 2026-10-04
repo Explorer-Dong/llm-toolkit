@@ -1,7 +1,7 @@
 [project]
 name = "aime-bench"
 version = "0.1.0"
-description = "One-shot harness for the AIME math benchmark (2024/2025/2026)."
+description = "Single-turn harness for the AIME math benchmark (2024/2025/2026)."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

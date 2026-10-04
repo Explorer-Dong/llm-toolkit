@@ -1,7 +1,7 @@
 [project]
 name = "gpqa-diamond-bench"
 version = "0.1.0"
-description = "One-shot harness for the GPQA-Diamond multiple-choice benchmark."
+description = "Single-turn harness for the GPQA-Diamond multiple-choice benchmark."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

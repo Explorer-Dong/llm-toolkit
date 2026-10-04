@@ -1,6 +1,6 @@
 # AIME
 
-Simple one-shot eval for [AIME 2024](https://huggingface.co/datasets/HuggingFaceH4/aime_2024), [AIME 2025](https://huggingface.co/datasets/MathArena/aime_2025) and [AIME 2026](https://huggingface.co/datasets/MathArena/aime_2026), 30 problems each with integer answers.
+Simple single-turn eval for [AIME 2024](https://huggingface.co/datasets/HuggingFaceH4/aime_2024), [AIME 2025](https://huggingface.co/datasets/MathArena/aime_2025) and [AIME 2026](https://huggingface.co/datasets/MathArena/aime_2026), 30 problems each with integer answers.
 
 The reply is graded by exact integer match, parsed from the final `{"answer": 123}` JSON.
 

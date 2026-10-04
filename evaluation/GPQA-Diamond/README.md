@@ -1,6 +1,6 @@
 # GPQA-Diamond
 
-Simple one-shot eval for [GPQA-Diamond](https://huggingface.co/datasets/fingertap/GPQA-Diamond), 198 four-choice science questions.
+Simple single-turn eval for [GPQA-Diamond](https://huggingface.co/datasets/fingertap/GPQA-Diamond), 198 four-choice science questions.
 
 The reply is graded by the chosen letter, parsed from the final `{"answer": "A"}` JSON.
 

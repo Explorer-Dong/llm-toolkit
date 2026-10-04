@@ -103,7 +103,7 @@ class EvalUtil:
     @staticmethod
     def parse_args() -> argparse.Namespace:
         load_dotenv(HERE / ".env")
-        parser = argparse.ArgumentParser(description="One-shot harness for GPQA-Diamond")
+        parser = argparse.ArgumentParser(description="Single-turn harness for GPQA-Diamond")
         parser.add_argument("--model", default=os.getenv("MODEL_NAME"), required=not os.getenv("MODEL_NAME"))
         parser.add_argument("--base-url", default=os.getenv("BASE_URL"), required=not os.getenv("BASE_URL"))
         parser.add_argument("--api-key", default=os.getenv("API_KEY", "EMPTY"), help="API key for the model endpoint")
