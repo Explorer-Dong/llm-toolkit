@@ -1,0 +1,14 @@
+services:
+  crawl4ai:
+    image: unclecode/crawl4ai:0.9.4
+    container_name: crawl4ai_v0.9.4
+    ports:
+      - "11235:11235"
+    shm_size: 1g
+    environment:
+      CRAWL4AI_API_TOKEN: sk-vincent  # change to your token
+      HTTP_PROXY: http://host.docker.internal:7897
+      HTTPS_PROXY: http://host.docker.internal:7897
+      NO_PROXY: "localhost,127.0.0.1,host.docker.internal"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

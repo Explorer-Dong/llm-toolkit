@@ -1,0 +1,21 @@
+[project]
+name = "gaia-react-harness"
+version = "0.1.0"
+description = "Async ReAct harness for the GAIA text-only subset."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16",
+    "ty>=0.0.84",
+]
+
+[tool.uv]
+package = false
