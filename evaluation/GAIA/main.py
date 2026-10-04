@@ -7,6 +7,7 @@ import string
 import sys
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -21,8 +22,9 @@ DATA_DIR = HERE / "data"
 DATA_FILE = "text103.json"
 OUTPUT_DIR = HERE / "outputs"
 TOOL_TIMEOUT_SEC = 60
-RETRY_ATTEMPTS = 3
-RETRY_BASE_DELAY = 2.0
+WEB_MAX_RETRIES = 3
+LLM_MAX_RETRIES = 3
+RETRY_BASE_DELAY = 3
 
 SYSTEM_PROMPT = """You are a careful agent solving a GAIA benchmark question.
 
@@ -83,41 +85,80 @@ TOOLS = [
 ]
 
 
-class ModelUtils:
-    """Parse streamed completions into content and tool calls."""
+@dataclass(frozen=True)
+class ModelParams:
+    """Static fields of one chat-completion request; messages and tools vary per call."""
 
-    @staticmethod
-    def clean_text(text: str, limit: int) -> str:
-        text = re.sub(r"\s+", " ", text).strip()
-        return text[:limit] + (" ..." if len(text) > limit else "")
+    model: str
+    temperature: float
+    top_p: float
+    max_tokens: int
+    seed: int
+    enable_thinking: bool
+
+
+class ModelUtils:
+    """Utils for model during interaction."""
 
     @staticmethod
     async def call_model(
         request_sem: asyncio.Semaphore,
         client: AsyncOpenAI,
-        request: dict[str, Any],
+        params: ModelParams,
+        messages: list[dict[str, Any]],
         stats: dict[str, Any] | None = None,
-    ) -> tuple[str, list[dict[str, Any]]]:
-        "Stream one chat completion; return (content, tool_calls) and fold usage into stats."
+        tools: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, list[dict[str, Any]], str, dict[str, int] | None]:
+        "Stream one chat completion; return (content, tool_calls, reasoning, usage) and fold usage into stats."
 
+        # reasoning_content and usage are log-only extensions; keep them out of the wire request
+        request: dict[str, Any] = {
+            "model": params.model,
+            "messages": [
+                {key: value for key, value in message.items() if key not in ("reasoning_content", "usage")}
+                for message in messages
+            ],
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "max_tokens": params.max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": params.enable_thinking}},
+            "seed": params.seed,
+        }
+        if tools is not None:
+            request["tools"] = tools
         async with request_sem:
             stream = await client.chat.completions.create(**request)
             content_parts: list[str] = []
+            reasoning_parts: list[str] = []
             calls: dict[int, dict[str, Any]] = {}
             finish_reason = "unknown"
+            call_usage: dict[str, int] | None = None
             try:
                 async for chunk in stream:
                     usage = getattr(chunk, "usage", None)
-                    if usage is not None and stats is not None:
-                        stats["completion_tokens"] += usage.completion_tokens or 0
+                    if usage is not None:
                         details = getattr(usage, "completion_tokens_details", None)
-                        stats["reasoning_tokens"] += getattr(details, "reasoning_tokens", 0) or 0
+                        call_usage = {
+                            "prompt_tokens": usage.prompt_tokens or 0,
+                            "completion_tokens": usage.completion_tokens or 0,
+                            "reasoning_tokens": getattr(details, "reasoning_tokens", 0) or 0,
+                        }
+                        if stats is not None:
+                            stats["prompt_tokens"] += call_usage["prompt_tokens"]
+                            stats["completion_tokens"] += call_usage["completion_tokens"]
+                            stats["reasoning_tokens"] += call_usage["reasoning_tokens"]
                     for choice in chunk.choices or ():
                         if choice.finish_reason:
                             finish_reason = choice.finish_reason
                         delta = choice.delta
                         if getattr(delta, "content", None):
                             content_parts.append(delta.content)
+                        # some servers stream reasoning as `reasoning`, others as `reasoning_content`
+                        reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
                         for call in getattr(delta, "tool_calls", None) or ():
                             index = call.index if call.index is not None else len(calls)
                             slot = calls.setdefault(index, {"id": None, "name": None, "arguments": []})
@@ -144,7 +185,28 @@ class ModelUtils:
             parsed_calls.append(
                 {"id": slot["id"] or f"call_missing_{index}", "name": slot["name"], "arguments": arguments}
             )
-        return "".join(content_parts), parsed_calls
+        return "".join(content_parts), parsed_calls, "".join(reasoning_parts), call_usage
+
+    @staticmethod
+    async def call_tool(name: str, arguments: dict[str, Any], client_search, client_read, args) -> str:
+        """Call tool. Return tool execution results or tool error"""
+        key = {"search": "query", "read": "url"}.get(name, "input")
+        value = str(arguments.get(key, arguments.get("input", "")))
+        try:
+            if name == "search":
+                call = ModelUtils._tool_search(client_search, value, args.search_results, args.serper_api_key)
+            elif name == "read":
+                call = ModelUtils._tool_read(
+                    client_read, value, args.observation_chars, args.crawl4ai_url, args.crawl4ai_token
+                )
+            else:
+                return f"Unknown tool {name!r}. Use search or read."
+            raw_observation = await asyncio.wait_for(call, TOOL_TIMEOUT_SEC)
+            return ModelUtils._clean_text(raw_observation, args.observation_chars)
+        except TimeoutError:
+            return f"Tool error: the call was cancelled after exceeding {TOOL_TIMEOUT_SEC}s."
+        except Exception as exc:  # noqa: BLE001 - tool failures become observations
+            return f"Tool error: {type(exc).__name__}: {exc}"
 
     @staticmethod
     def normalize_text(value: str, remove_punctuation: bool = True) -> str:
@@ -163,18 +225,19 @@ class ModelUtils:
         except ValueError:
             return None
 
-
-class AgentTool:
-    """Actions the agent can invoke each step."""
+    @staticmethod
+    def _clean_text(text: str, limit: int) -> str:
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:limit] + (" ..." if len(text) > limit else "")
 
     @staticmethod
-    async def with_backoff(fetch: Callable[[], Awaitable[httpx.Response]]) -> httpx.Response:
+    async def _fetch_with_retry(fetch: Callable[[], Awaitable[httpx.Response]]) -> httpx.Response:
         "Run an HTTP call, retrying transient failures with exponential backoff."
 
         last: Exception | None = None
-        for attempt in range(RETRY_ATTEMPTS):
+        for attempt in range(WEB_MAX_RETRIES):
             if attempt:
-                await asyncio.sleep(RETRY_BASE_DELAY * 2 ** (attempt - 1))
+                await asyncio.sleep(RETRY_BASE_DELAY**attempt)
             try:
                 return await fetch()
             except httpx.HTTPError as exc:
@@ -182,9 +245,9 @@ class AgentTool:
         raise last
 
     @staticmethod
-    async def web_search(web: httpx.AsyncClient, query: str, limit: int, api_key: str) -> str:
+    async def _tool_search(client_search: httpx.AsyncClient, query: str, limit: int, api_key: str) -> str:
         async def post() -> httpx.Response:
-            response = await web.post(
+            response = await client_search.post(
                 "https://google.serper.dev/search",
                 headers={"X-API-KEY": api_key},
                 json={"q": query, "num": limit},
@@ -192,7 +255,7 @@ class AgentTool:
             response.raise_for_status()
             return response
 
-        response = await AgentTool.with_backoff(post)
+        response = await ModelUtils._fetch_with_retry(post)
         results = []
         for result in response.json().get("organic", []):
             url = result.get("link", "")
@@ -200,9 +263,9 @@ class AgentTool:
                 continue
             results.append(
                 {
-                    "title": ModelUtils.clean_text(result.get("title", ""), 300),
+                    "title": ModelUtils._clean_text(result.get("title", ""), 300),
                     "url": url,
-                    "snippet": ModelUtils.clean_text(result.get("snippet", ""), 700),
+                    "snippet": ModelUtils._clean_text(result.get("snippet", ""), 700),
                 }
             )
         if not results:
@@ -210,26 +273,23 @@ class AgentTool:
         return json.dumps(results, ensure_ascii=False, indent=2)
 
     @staticmethod
-    async def open_page(web: httpx.AsyncClient, url: str, limit: int, server: str, token: str) -> str:
+    async def _tool_read(read_client: httpx.AsyncClient, url: str, limit: int, server: str, token: str) -> str:
         if not url.startswith(("http://", "https://")):
             return "The read tool only accepts an http(s) URL."
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        headers = {"Authorization": f"Bearer {token}"}
 
         async def post() -> httpx.Response:
-            response = await web.post(
+            response = await read_client.post(
                 f"{server.rstrip('/')}/md",
                 json={"url": url},
                 headers=headers,
-                # crawl4ai renders the page server-side before answering; the web client's
-                # read timeout is per chunk, so this only needs to outlive run_tool's
-                # wait_for cap (TOOL_TIMEOUT_SEC), which is the real bound
                 timeout=httpx.Timeout(TOOL_TIMEOUT_SEC + 10, connect=10.0),
             )
             response.raise_for_status()
             return response
 
         try:
-            response = await AgentTool.with_backoff(post)
+            response = await ModelUtils._fetch_with_retry(post)
         except httpx.ConnectError:
             return f"Tool error: crawl4ai server unreachable at {server}."
         payload = response.json()
@@ -238,7 +298,7 @@ class AgentTool:
         markdown = payload.get("markdown") or ""
         if isinstance(markdown, dict):
             markdown = markdown.get("fit_markdown") or markdown.get("raw_markdown") or ""
-        text = ModelUtils.clean_text(markdown, limit)
+        text = ModelUtils._clean_text(markdown, limit)
         return text or "The page contained no readable text."
 
 
@@ -247,57 +307,41 @@ class EvalUtil:
     def parse_args() -> argparse.Namespace:
         load_dotenv(HERE / ".env")
         parser = argparse.ArgumentParser(description="ReAct harness for GAIA text-only")
-        parser.add_argument("--model", default=os.getenv("MODEL_NAME"), required=not os.getenv("MODEL_NAME"))
-        parser.add_argument("--base-url", default=os.getenv("BASE_URL"), required=not os.getenv("BASE_URL"))
-        parser.add_argument("--api-key", default=os.getenv("API_KEY", "EMPTY"), help="API key for the model endpoint")
-        parser.add_argument(
-            "--serper-api-key",
-            default=os.getenv("SERPER_API_KEY"),
-            required=not os.getenv("SERPER_API_KEY"),
-            help="search tool api-key",
-        )
+        parser.add_argument("--model", default=os.getenv("MODEL_NAME"))
+        parser.add_argument("--base-url", default=os.getenv("BASE_URL"))
+        parser.add_argument("--api-key", default=os.getenv("API_KEY", "EMPTY"))
+        parser.add_argument("--serper-api-key", default=os.getenv("SERPER_API_KEY"))
         parser.add_argument("--limit", type=int, default=None, help="run the first N matching tasks")
         parser.add_argument("--level", type=int, choices=(1, 2, 3), help="only run tasks of this GAIA level")
         parser.add_argument("--concurrency", type=int, default=4, help="maximum concurrent model requests")
         parser.add_argument("--max-steps", type=int, default=16, help="maximum tool-use turns per task")
         parser.add_argument("--search-results", type=int, default=8, help="number of search results per query")
-        parser.add_argument(
-            "--observation-chars", type=int, default=12000, help="observation text truncation limit in characters"
-        )
-        parser.add_argument(
-            "--crawl4ai-url",
-            default=os.getenv("CRAWL4AI_URL", "http://localhost:11235"),
-            help="crawl4ai docker server base URL",
-        )
-        parser.add_argument(
-            "--crawl4ai-token", default=os.getenv("CRAWL4AI_TOKEN", ""), help="bearer token for the crawl4ai server"
-        )
+        parser.add_argument("--observation-chars", type=int, default=12000, help="observation text truncation limit")
+        parser.add_argument("--crawl4ai-url", default=os.getenv("CRAWL4AI_URL"))
+        parser.add_argument("--crawl4ai-token", default=os.getenv("CRAWL4AI_TOKEN"))
         parser.add_argument("--seed", type=int, default=42, help="sampling seed for reproducible runs")
         parser.add_argument("--temperature", type=float, default=0, help="sampling temperature for model requests")
         parser.add_argument("--top-p", type=float, default=0.95, help="nucleus sampling cutoff")
         parser.add_argument("--enable-thinking", action="store_true", help="enable the model's thinking mode")
         parser.add_argument("--max-tokens", type=int, default=8192, help="completion token limit per model request")
         parser.add_argument("--timeout", type=float, default=900.0, help="per model request timeout in seconds")
-        parser.add_argument(
-            "--task-timeout", type=int, default=3600, help="per-task wall-clock budget in seconds; 0 disables"
-        )
+        parser.add_argument("--task-timeout", type=int, default=3600, help="per-task time budget in seconds")
         return parser.parse_args()
 
     @staticmethod
     def load_tasks(path: Path, limit: int | None, level: int | None) -> list[dict[str, Any]]:
-        rows = json.loads(path.read_text(encoding="utf-8"))
+        raw_tasks = json.loads(path.read_text(encoding="utf-8"))
         tasks = []
-        for row in rows:
-            row_level = int(row.get("Level", 0))
-            if level is not None and row_level != level:
+        for raw_task in raw_tasks:
+            if level is not None and level != int(raw_task["Level"]):
                 continue
             tasks.append(
                 {
-                    "id": str(row.get("id")),
-                    "task_id": str(row.get("task_id") or row.get("id")),
-                    "question": str(row["Question"]),
-                    "gold": str(row["answer"]),
-                    "level": row_level,
+                    "id": str(raw_task["id"]),
+                    "task_id": str(raw_task["task_id"]),
+                    "question": str(raw_task["Question"]),
+                    "gold": str(raw_task["answer"]),
+                    "level": int(raw_task["Level"]),
                 }
             )
             if limit is not None and len(tasks) >= limit:
@@ -307,37 +351,35 @@ class EvalUtil:
         return tasks
 
     @staticmethod
-    def write_predictions(output_path: Path, records: list[dict[str, Any]]) -> None:
-        "Rewrite the whole JSON array atomically."
-
-        tmp_path = output_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp_path, output_path)
-
-    @staticmethod
     async def run(args: argparse.Namespace, tasks: list[dict[str, Any]], output_path: Path) -> list[dict[str, Any]]:
-        client = AsyncOpenAI(
+        client_llm = AsyncOpenAI(
             api_key=args.api_key,
             base_url=args.base_url,
             timeout=args.timeout,
-            max_retries=3,
-            # openai 2.x vendors httpx as httpx2 and types this parameter against it;
-            # the plain httpx client is interface-compatible at runtime
+            max_retries=LLM_MAX_RETRIES,
             http_client=httpx.AsyncClient(trust_env=False),  # ty: ignore[invalid-argument-type]
         )
-        # page fetches must not inherit the model-request timeout (900s): one hanging
-        # page would block a task past its deadline, which is only checked between steps
-        timeout = httpx.Timeout(30.0, connect=10.0)
         headers = {"User-Agent": "gaia-react-harness/1.0"}
+        params = ModelParams(
+            model=args.model,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_tokens=args.max_tokens,
+            seed=args.seed,
+            enable_thinking=args.enable_thinking,
+        )
         request_sem = asyncio.Semaphore(args.concurrency)
         records: list[dict[str, Any]] = []
-        # crawl4ai is local, so it must bypass any ambient http_proxy the shell exports
         async with (
-            httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as web,
-            httpx.AsyncClient(trust_env=False, follow_redirects=True) as crawl_web,
+            httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0), headers=headers, follow_redirects=True
+            ) as client_search,
+            httpx.AsyncClient(trust_env=False, follow_redirects=True) as read_client,
         ):
             pending = [
-                asyncio.create_task(EvalUtil._run_helper(task, client, web, crawl_web, args.model, request_sem, args))
+                asyncio.create_task(
+                    EvalUtil._solve_one_task(task, client_llm, client_search, read_client, params, request_sem, args)
+                )
                 for task in tasks
             ]
             try:
@@ -345,7 +387,7 @@ class EvalUtil:
                     for future in asyncio.as_completed(pending):
                         record = await future
                         records.append(record)
-                        EvalUtil.write_predictions(output_path, records)
+                        EvalUtil._write_predictions(output_path, records)
                         score = f"{sum(r['score'] for r in records)}/{len(records)}"
                         progress.set_postfix(score=score)
                         progress.update(1)
@@ -354,16 +396,45 @@ class EvalUtil:
                     if not future.done():
                         future.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
-                await client.close()
+                await client_llm.close()
+
         return records
 
     @staticmethod
-    async def _run_helper(
+    def build_summary(records: list[dict[str, Any]], model: str) -> dict[str, Any]:
+        by_level: dict[int, dict[str, Any]] = {}
+        for level in sorted({record["level"] for record in records}):
+            subset = [record for record in records if record["level"] == level]
+            by_level[level] = {
+                "num_tasks": len(subset),
+                "correct": sum(record["score"] for record in subset),
+                "score": sum(record["score"] for record in subset) / len(subset),
+            }
+        return {
+            "benchmark": "GAIA",
+            "model": model,
+            "num_tasks": len(records),
+            "correct": sum(record["score"] for record in records),
+            "score": round(sum(record["score"] for record in records) / len(records), 2) if records else 0.0,
+            "sys_errors": sum(record["sys_error"] is not None for record in records),
+            "by_level": by_level,
+        }
+
+    @staticmethod
+    def _write_predictions(output_path: Path, records: list[dict[str, Any]]) -> None:
+        "Rewrite the whole JSON array atomically."
+
+        tmp_path = output_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, output_path)
+
+    @staticmethod
+    async def _solve_one_task(
         task: dict[str, Any],
-        client: AsyncOpenAI,
-        web: httpx.AsyncClient,
-        crawl_web: httpx.AsyncClient,
-        model: str,
+        client_llm: AsyncOpenAI,
+        client_search: httpx.AsyncClient,
+        client_read: httpx.AsyncClient,
+        params: ModelParams,
         request_sem: asyncio.Semaphore,
         args: argparse.Namespace,
     ) -> dict[str, Any]:
@@ -372,85 +443,62 @@ class EvalUtil:
             {"role": "user", "content": task["question"]},
         ]
         steps = 0
-        stats: dict[str, Any] = {"completion_tokens": 0, "reasoning_tokens": 0, "finish_reasons": {}}
+        stats: dict[str, Any] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "finish_reasons": {},
+        }
         final_answer: str | None = None
-        error: str | None = None
+        sys_error: str | None = None
         started = time.perf_counter()
-
-        async def complete(with_tools: bool = True) -> tuple[str, list[dict[str, Any]]]:
-            request: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "max_tokens": args.max_tokens,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-                "extra_body": {"chat_template_kwargs": {"enable_thinking": args.enable_thinking}},
-            }
-            if with_tools:
-                request["tools"] = TOOLS
-            if args.seed is not None:
-                request["seed"] = args.seed
-            return await ModelUtils.call_model(request_sem, client, request, stats)
-
-        async def run_tool(name: str, arguments: dict[str, Any]) -> str:
-            key = {"search": "query", "read": "url"}.get(name, "input")
-            value = str(arguments.get(key, arguments.get("input", "")))
-            try:
-                if name == "search":
-                    call = AgentTool.web_search(web, value, args.search_results, args.serper_api_key)
-                elif name == "read":
-                    call = AgentTool.open_page(
-                        crawl_web, value, args.observation_chars, args.crawl4ai_url, args.crawl4ai_token
-                    )
-                else:
-                    return f"Unknown tool {name!r}. Use search or read."
-                # httpx read timeouts apply between chunks, so a trickling server has no
-                # total-time cap; wait_for keeps one bad fetch from stalling the task
-                return await asyncio.wait_for(call, TOOL_TIMEOUT_SEC)
-            except TimeoutError:
-                return f"Tool error: the call was cancelled after exceeding {TOOL_TIMEOUT_SEC}s."
-            except Exception as exc:  # noqa: BLE001 - tool failures become observations
-                return f"Tool error: {type(exc).__name__}: {exc}"
-
         deadline = started + args.task_timeout if args.task_timeout else None
         timed_out = False
+
+        # ReAct implementation
         try:
             for _step in range(1, args.max_steps + 1):
                 if deadline is not None and time.perf_counter() >= deadline:
                     timed_out = True
                     break
-                content, calls = await complete()
+                content, calls, reasoning, usage = await ModelUtils.call_model(
+                    request_sem, client_llm, params, messages, stats, tools=TOOLS
+                )
                 steps += 1
 
                 if calls:
-                    messages.append(
+                    message: dict[str, Any] = {"role": "assistant", "content": content or None}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
+                    message["tool_calls"] = [
                         {
-                            "role": "assistant",
-                            "content": content or None,
-                            "tool_calls": [
-                                {
-                                    "id": call["id"],
-                                    "type": "function",
-                                    "function": {
-                                        "name": call["name"],
-                                        "arguments": json.dumps(call["arguments"], ensure_ascii=False),
-                                    },
-                                }
-                                for call in calls
-                            ],
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["name"],
+                                "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+                            },
                         }
-                    )
+                        for call in calls
+                    ]
+                    if usage:
+                        message["usage"] = usage
+                    messages.append(message)
                     for call in calls:
-                        observation = await run_tool(call["name"], call["arguments"])
-                        observation = ModelUtils.clean_text(observation, args.observation_chars)
+                        observation = await ModelUtils.call_tool(
+                            call["name"], call["arguments"], client_search, client_read, args
+                        )
                         messages.append({"role": "tool", "tool_call_id": call["id"], "content": observation})
                     continue
 
                 if content:
                     final_answer = content
-                    messages.append({"role": "assistant", "content": content})
+                    message = {"role": "assistant", "content": content}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
+                    if usage:
+                        message["usage"] = usage
+                    messages.append(message)
                     break
 
                 messages.append(
@@ -462,6 +510,7 @@ class EvalUtil:
                         ),
                     }
                 )
+
             if final_answer is None:
                 messages.append(
                     {
@@ -472,38 +521,54 @@ class EvalUtil:
                         ),
                     }
                 )
-                content, _ = await complete(with_tools=False)
+                content, _, reasoning, usage = await ModelUtils.call_model(
+                    request_sem, client_llm, params, messages, stats
+                )
                 final_answer = content.strip() or None
                 if content:
-                    messages.append({"role": "assistant", "content": content})
+                    message = {"role": "assistant", "content": content}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
+                    if usage:
+                        message["usage"] = usage
+                    messages.append(message)
                 if final_answer is None:
                     if timed_out:
-                        error = f"task_timeout ({args.task_timeout}s)"
+                        sys_error = f"task_timeout ({args.task_timeout}s)"
                     else:
-                        error = f"max_steps_exceeded ({args.max_steps})"
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+                        sys_error = f"max_steps_exceeded ({args.max_steps})"
 
-        # the agent tends to wrap the answer in reasoning text; one cheap extraction
-        # request recovers the bare value for the exact-match grader
+        except Exception as exc:
+            sys_error = f"{type(exc).__name__}: {exc}"
+
+        # LLM-as-an-extractor
         answer = final_answer
-        if error is None and final_answer and not EvalUtil._rubric(final_answer, task["gold"]):
+        if sys_error is None and final_answer and not EvalUtil._rubric(final_answer, task["gold"]):
             try:
                 messages.append(
                     {
                         "role": "user",
-                        "content": EXTRACT_PROMPT.format(question=task["question"][:600], raw=final_answer[:3000]),
+                        "content": EXTRACT_PROMPT.format(question=task["question"], raw=final_answer),
                     }
                 )
-                content, _ = await complete(with_tools=False)
+                content, _, reasoning, usage = await ModelUtils.call_model(
+                    request_sem, client_llm, params, messages, stats
+                )
                 extracted = content.strip()
                 if extracted:
                     answer = extracted
-                    messages.append({"role": "assistant", "content": content})
+                    message = {"role": "assistant", "content": content}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
+                    if usage:
+                        message["usage"] = usage
+                    messages.append(message)
             except Exception:
                 pass
 
-        correct = EvalUtil._rubric(answer, task["gold"]) if error is None else False
+        # judge prediction
+        correct = EvalUtil._rubric(answer, task["gold"]) if sys_error is None else False
+
         return {
             "id": task["id"],
             "task_id": task["task_id"],
@@ -512,11 +577,12 @@ class EvalUtil:
             "extracted_prediction": answer,
             "score": int(correct),
             "steps": steps,
+            "prompt_tokens": stats["prompt_tokens"],
             "completion_tokens": stats["completion_tokens"],
             "reasoning_tokens": stats["reasoning_tokens"],
             "finish_reasons": stats["finish_reasons"],
             "latency_sec": round(time.perf_counter() - started, 3),
-            "sys_error": error,
+            "sys_error": sys_error,
             "messages": messages,
         }
 
@@ -547,27 +613,6 @@ class EvalUtil:
             return True
         return ModelUtils.normalize_text(prediction) == ModelUtils.normalize_text(gold)
 
-    @staticmethod
-    def build_summary(records: list[dict[str, Any]], model: str, output_path: Path) -> dict[str, Any]:
-        by_level: dict[int, dict[str, Any]] = {}
-        for level in sorted({record["level"] for record in records}):
-            subset = [record for record in records if record["level"] == level]
-            by_level[level] = {
-                "num_tasks": len(subset),
-                "correct": sum(record["score"] for record in subset),
-                "score": sum(record["score"] for record in subset) / len(subset),
-            }
-        return {
-            "benchmark": "GAIA",
-            "model": model,
-            "num_tasks": len(records),
-            "correct": sum(record["score"] for record in records),
-            "score": sum(record["score"] for record in records) / len(records) if records else 0.0,
-            "errors": sum(record["sys_error"] is not None for record in records),
-            "by_level": by_level,
-            "output": str(output_path),
-        }
-
 
 def main() -> int:
     # load data
@@ -587,11 +632,10 @@ def main() -> int:
     print(f"Running GAIA tasks with {args.model}; output: {run_dir}")
 
     # run evaluation
-    output_path = run_dir / "predictions.json"
-    records = asyncio.run(EvalUtil.run(args, tasks, output_path))
+    records = asyncio.run(EvalUtil.run(args, tasks, run_dir / "predictions.json"))
 
     # log summary after evaluation
-    summary = EvalUtil.build_summary(records, args.model, output_path)
+    summary = EvalUtil.build_summary(records, args.model)
     (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

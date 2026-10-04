@@ -31,7 +31,7 @@ Run GAIA:
 uv run main.py
 
 # enable thinking
-uv run main.py --enable-thinking --max-tokens 81920 --timeout 1800 --task-timeout 7200
+uv run main.py --enable-thinking --max-tokens 16384 --timeout 1800 --task-timeout 7200
 
 # see more options with:
 uv run main.py --help

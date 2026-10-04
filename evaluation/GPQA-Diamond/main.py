@@ -17,6 +17,7 @@ HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE / "data"
 DATA_FILE = "diamond198.json"
 OUTPUT_DIR = HERE / "outputs"
+LLM_MAX_RETRIES = 3
 CHOICE_LABELS = ("A", "B", "C", "D")
 
 SYSTEM_PROMPT = """You are solving a multiple-choice benchmark problem.
@@ -39,7 +40,59 @@ class ModelUtils:
     ANSWER_CHOICE_RE = re.compile(r"[\"']?answer[\"']?\s*[:=]\s*[\"']?([ABCD])[\"']?", re.IGNORECASE)
 
     @staticmethod
-    def last_json_object(text: str) -> dict[str, Any] | None:
+    async def call_model(
+        request_sem: asyncio.Semaphore,
+        client: AsyncOpenAI,
+        request: dict[str, Any],
+    ) -> tuple[str, str, dict[str, int] | None, str | None]:
+        "Stream the single chat completion; return (content, reasoning, usage, finish_reason)."
+
+        async with request_sem:
+            stream = await client.chat.completions.create(**request)
+            parts: list[str] = []
+            reasoning_parts: list[str] = []
+            usage: dict[str, int] | None = None
+            finish_reason: str | None = None
+            try:
+                async for chunk in stream:
+                    chunk_usage = getattr(chunk, "usage", None)
+                    if chunk_usage is not None:
+                        details = getattr(chunk_usage, "completion_tokens_details", None)
+                        usage = {
+                            "prompt_tokens": chunk_usage.prompt_tokens or 0,
+                            "completion_tokens": chunk_usage.completion_tokens or 0,
+                            "reasoning_tokens": getattr(details, "reasoning_tokens", 0) or 0,
+                        }
+                    for choice in chunk.choices or ():
+                        if choice.finish_reason:
+                            finish_reason = choice.finish_reason
+                        delta = choice.delta
+                        content = getattr(delta, "content", None)
+                        if content:
+                            parts.append(content)
+                        # some servers stream reasoning as `reasoning`, others as `reasoning_content`
+                        reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
+            finally:
+                await stream.close()
+        return "".join(parts), "".join(reasoning_parts), usage, finish_reason
+
+    @staticmethod
+    def parse_answer(text: str) -> str | None:
+        parsed = ModelUtils._last_json_object(text)
+        if parsed is not None and "answer" in parsed:
+            choice = ModelUtils._normalize_choice(parsed.get("answer"))
+            if choice is not None:
+                return choice
+        answer_matches = ModelUtils.ANSWER_CHOICE_RE.findall(text)
+        if answer_matches:
+            return answer_matches[-1].upper()
+        choice_matches = ModelUtils.CHOICE_RE.findall(text)
+        return choice_matches[-1].upper() if choice_matches else None
+
+    @staticmethod
+    def _last_json_object(text: str) -> dict[str, Any] | None:
         end_positions = [i for i, char in enumerate(text) if char == "}"]
         for end in reversed(end_positions):
             start = text.rfind("{", 0, end + 1)
@@ -56,7 +109,7 @@ class ModelUtils:
         return None
 
     @staticmethod
-    def normalize_choice(value: Any) -> str | None:
+    def _normalize_choice(value: Any) -> str | None:
         if value is None:
             return None
         text = str(value).strip().upper()
@@ -64,51 +117,6 @@ class ModelUtils:
             return text
         match = ModelUtils.CHOICE_RE.search(text)
         return match.group(1).upper() if match else None
-
-    @staticmethod
-    def parse_answer(text: str) -> str | None:
-        parsed = ModelUtils.last_json_object(text)
-        if parsed is not None and "answer" in parsed:
-            choice = ModelUtils.normalize_choice(parsed.get("answer"))
-            if choice is not None:
-                return choice
-        answer_matches = ModelUtils.ANSWER_CHOICE_RE.findall(text)
-        if answer_matches:
-            return answer_matches[-1].upper()
-        choice_matches = ModelUtils.CHOICE_RE.findall(text)
-        return choice_matches[-1].upper() if choice_matches else None
-
-    @staticmethod
-    async def call_model(
-        request_sem: asyncio.Semaphore,
-        client: AsyncOpenAI,
-        request: dict[str, Any],
-        stats: dict[str, Any] | None = None,
-    ) -> str:
-        "Stream one chat completion; return its content and fold usage into stats."
-
-        async with request_sem:
-            stream = await client.chat.completions.create(**request)
-            parts: list[str] = []
-            finish_reason = "unknown"
-            try:
-                async for chunk in stream:
-                    usage = getattr(chunk, "usage", None)
-                    if usage is not None and stats is not None:
-                        stats["completion_tokens"] += usage.completion_tokens or 0
-                        details = getattr(usage, "completion_tokens_details", None)
-                        stats["reasoning_tokens"] += getattr(details, "reasoning_tokens", 0) or 0
-                    for choice in chunk.choices or ():
-                        if choice.finish_reason:
-                            finish_reason = choice.finish_reason
-                        content = getattr(choice.delta, "content", None)
-                        if content:
-                            parts.append(content)
-            finally:
-                await stream.close()
-        if stats is not None:
-            stats["finish_reasons"][finish_reason] = stats["finish_reasons"].get(finish_reason, 0) + 1
-        return "".join(parts)
 
 
 class EvalUtil:
@@ -149,16 +157,10 @@ class EvalUtil:
         return tasks
 
     @staticmethod
-    def write_predictions(output_path: Path, records: list[dict[str, Any]]) -> None:
-        "Rewrite the whole JSON array atomically."
-
-        tmp_path = output_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp_path, output_path)
-
-    @staticmethod
     async def run(args: argparse.Namespace, tasks: list[dict[str, Any]], output_path: Path) -> list[dict[str, Any]]:
-        client = AsyncOpenAI(api_key=args.api_key, base_url=args.base_url, timeout=args.timeout, max_retries=3)
+        client = AsyncOpenAI(
+            api_key=args.api_key, base_url=args.base_url, timeout=args.timeout, max_retries=LLM_MAX_RETRIES
+        )
         request_sem = asyncio.Semaphore(args.concurrency)
         records: list[dict[str, Any]] = []
         pending = [
@@ -169,7 +171,7 @@ class EvalUtil:
                 for future in asyncio.as_completed(pending):
                     record = await future
                     records.append(record)
-                    EvalUtil.write_predictions(output_path, records)
+                    EvalUtil._write_predictions(output_path, records)
                     progress.set_postfix(score=f"{sum(r['score'] for r in records)}/{len(records)}")
                     progress.update(1)
         finally:
@@ -179,6 +181,26 @@ class EvalUtil:
             await asyncio.gather(*pending, return_exceptions=True)
             await client.close()
         return records
+
+    @staticmethod
+    def build_summary(records: list[dict[str, Any]], model: str, output_path: Path) -> dict[str, Any]:
+        return {
+            "benchmark": "GPQA-Diamond",
+            "model": model,
+            "num_tasks": len(records),
+            "correct": sum(record["score"] for record in records),
+            "score": sum(record["score"] for record in records) / len(records) if records else 0.0,
+            "sys_errors": sum(record["sys_error"] is not None for record in records),
+            "output": str(output_path),
+        }
+
+    @staticmethod
+    def _write_predictions(output_path: Path, records: list[dict[str, Any]]) -> None:
+        "Rewrite the whole JSON array atomically."
+
+        tmp_path = output_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, output_path)
 
     @staticmethod
     async def _run_helper(
@@ -193,9 +215,11 @@ class EvalUtil:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"{task['question']}\n\n{choices}"},
         ]
-        stats: dict[str, Any] = {"completion_tokens": 0, "reasoning_tokens": 0, "finish_reasons": {}}
         sys_error: str | None = None
         output: str | None = None
+        reasoning = ""
+        usage: dict[str, int] | None = None
+        finish_reason: str | None = None
         started = time.perf_counter()
 
         request: dict[str, Any] = {
@@ -213,21 +237,30 @@ class EvalUtil:
             request["seed"] = args.seed
 
         try:
-            output = (await ModelUtils.call_model(request_sem, client, request, stats)).strip()
+            output, reasoning, usage, finish_reason = await ModelUtils.call_model(request_sem, client, request)
+            output = output.strip()
             if output:
-                messages.append({"role": "assistant", "content": output})
+                message: dict[str, Any] = {"role": "assistant", "content": output}
+                if reasoning:
+                    message["reasoning_content"] = reasoning
+                if usage:
+                    message["usage"] = usage
+                messages.append(message)
         except Exception as exc:
             sys_error = f"{type(exc).__name__}: {exc}"
 
+        if usage is None:
+            usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}
         correct = EvalUtil._rubric(output, task["gold"]) if not sys_error else False
         return {
             "id": task["id"],
             "answer": task["gold"],
             "extracted_prediction": ModelUtils.parse_answer(output or ""),
             "score": int(correct),
-            "completion_tokens": stats["completion_tokens"],
-            "reasoning_tokens": stats["reasoning_tokens"],
-            "finish_reasons": stats["finish_reasons"],
+            "prompt_tokens": usage["prompt_tokens"],
+            "completion_tokens": usage["completion_tokens"],
+            "reasoning_tokens": usage["reasoning_tokens"],
+            "finish_reasons": finish_reason,
             "latency_sec": round(time.perf_counter() - started, 3),
             "sys_error": sys_error,
             "messages": messages,
@@ -241,18 +274,6 @@ class EvalUtil:
             return False
         parsed = ModelUtils.parse_answer(prediction)
         return parsed is not None and parsed == gold
-
-    @staticmethod
-    def build_summary(records: list[dict[str, Any]], model: str, output_path: Path) -> dict[str, Any]:
-        return {
-            "benchmark": "GPQA-Diamond",
-            "model": model,
-            "num_tasks": len(records),
-            "correct": sum(record["score"] for record in records),
-            "score": sum(record["score"] for record in records) / len(records) if records else 0.0,
-            "sys_errors": sum(record["sys_error"] is not None for record in records),
-            "output": str(output_path),
-        }
 
 
 def main() -> int:
