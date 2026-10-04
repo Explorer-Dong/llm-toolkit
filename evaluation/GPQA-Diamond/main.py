@@ -80,23 +80,35 @@ class ModelUtils:
 
     @staticmethod
     async def call_model(
-        request_sem: asyncio.Semaphore, client: AsyncOpenAI, request: dict[str, Any]
-    ) -> tuple[str, str | None]:
+        request_sem: asyncio.Semaphore,
+        client: AsyncOpenAI,
+        request: dict[str, Any],
+        stats: dict[str, Any] | None = None,
+    ) -> str:
+        "Stream one chat completion; return its content and fold usage into stats."
+
         async with request_sem:
             stream = await client.chat.completions.create(**request)
             parts: list[str] = []
-            finish_reason: str | None = None
+            finish_reason = "unknown"
             try:
                 async for chunk in stream:
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None and stats is not None:
+                        stats["completion_tokens"] += usage.completion_tokens or 0
+                        details = getattr(usage, "completion_tokens_details", None)
+                        stats["reasoning_tokens"] += getattr(details, "reasoning_tokens", 0) or 0
                     for choice in chunk.choices or ():
+                        if choice.finish_reason:
+                            finish_reason = choice.finish_reason
                         content = getattr(choice.delta, "content", None)
                         if content:
                             parts.append(content)
-                        if choice.finish_reason:
-                            finish_reason = choice.finish_reason
             finally:
                 await stream.close()
-            return "".join(parts), finish_reason
+        if stats is not None:
+            stats["finish_reasons"][finish_reason] = stats["finish_reasons"].get(finish_reason, 0) + 1
+        return "".join(parts)
 
 
 class EvalUtil:
@@ -181,9 +193,9 @@ class EvalUtil:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"{task['question']}\n\n{choices}"},
         ]
+        stats: dict[str, Any] = {"completion_tokens": 0, "reasoning_tokens": 0, "finish_reasons": {}}
         sys_error: str | None = None
         output: str | None = None
-        finish_reason: str | None = None
         started = time.perf_counter()
 
         request: dict[str, Any] = {
@@ -193,6 +205,7 @@ class EvalUtil:
             "top_p": args.top_p,
             "max_tokens": args.max_tokens,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if args.top_k:
             request["extra_body"] = {"top_k": args.top_k}
@@ -200,24 +213,24 @@ class EvalUtil:
             request["seed"] = args.seed
 
         try:
-            output, finish_reason = await ModelUtils.call_model(request_sem, client, request)
-            output = output.strip()
+            output = (await ModelUtils.call_model(request_sem, client, request, stats)).strip()
+            if output:
+                messages.append({"role": "assistant", "content": output})
         except Exception as exc:
             sys_error = f"{type(exc).__name__}: {exc}"
 
         correct = EvalUtil._rubric(output, task["gold"]) if not sys_error else False
         return {
             "id": task["id"],
-            "question": task["question"],
-            "choices": task["choices"],
-            "gold": task["gold"],
-            "prediction": ModelUtils.parse_answer(output or ""),
-            "output": output,
-            "finish_reason": finish_reason,
-            "correct": correct,
+            "answer": task["gold"],
+            "extracted_prediction": ModelUtils.parse_answer(output or ""),
             "score": int(correct),
+            "completion_tokens": stats["completion_tokens"],
+            "reasoning_tokens": stats["reasoning_tokens"],
+            "finish_reasons": stats["finish_reasons"],
             "latency_sec": round(time.perf_counter() - started, 3),
             "sys_error": sys_error,
+            "messages": messages,
         }
 
     @staticmethod
