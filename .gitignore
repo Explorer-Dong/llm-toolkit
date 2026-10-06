@@ -1,8 +1,2 @@
-__pycache__
 .ruff_cache
-.venv
-.env
-uv.lock
-
 docs/_*.md
-outputs
