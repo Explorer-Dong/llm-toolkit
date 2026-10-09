@@ -18,7 +18,7 @@ from eval import DATA_DIR, ROOT
 from eval.core import harness, model, runner
 from eval.core.model import Context
 
-DATA_FILE = "webwalkerqa680.json"
+DATA_FILE = "webwalkerqa_full.json"
 
 SYSTEM_PROMPT = """You are a careful agent. Solve step by step, DO NOT answer directly with your memory.
 
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crawl4ai-token", default=os.getenv("CRAWL4AI_TOKEN"))
     parser.add_argument("--type", type=str, choices=("single_source", "multi_source"), help="filter by question type")
     parser.add_argument("--difficulty", type=str, choices=("easy", "medium", "hard"), help="filter by difficulty")
-    parser.add_argument("--max-steps", type=int, default=15, help="maximum tool-use turns per task (paper uses 15)")
+    parser.add_argument("--max-steps", type=int, default=16, help="maximum tool-use turns per task (paper uses 15)")
     parser.add_argument("--search-results", type=int, default=8, help="number of search results per query")
     parser.add_argument("--observation-chars", type=int, default=12000, help="observation text truncation limit")
     parser.add_argument("--task-timeout", type=int, default=3600, help="per-task time budget in seconds")
@@ -182,6 +182,7 @@ async def amain(
                 output_path,
                 "WebWalkerQA ReAct",
                 params,
+                max_active_tasks=args.concurrency,
             )
     finally:
         await judge.close()
@@ -197,7 +198,12 @@ def main() -> int:
         "WebWalkerQA",
         args,
         secrets={"api_key", "serper_api_key", "crawl4ai_token", "judge_api_key"},
-        extra={"system_prompt": SYSTEM_PROMPT, "tools": [harness.SEARCH_SCHEMA, harness.READ_SCHEMA]},
+        extra={
+            "dataset_file": DATA_FILE,
+            "system_prompt": SYSTEM_PROMPT,
+            "judge_prompt": JUDGE_PROMPT,
+            "tools": [harness.SEARCH_SCHEMA, harness.READ_SCHEMA],
+        },
     )
     print(f"Running {len(tasks)} WebWalkerQA tasks with {args.model}; output: {run_dir}")
 

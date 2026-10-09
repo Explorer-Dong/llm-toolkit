@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
+    "math-verify[antlr4-13-2]==0.9.0",
     "openai>=1.0",
     "python-dotenv>=1.0",
     "tqdm>=4.66",
@@ -20,6 +21,7 @@ gpqa = "eval.gpqa:main"
 gaia = "eval.gaia:main"
 browsecomp = "eval.browsecomp:main"
 webwalkerqa = "eval.webwalkerqa:main"
+math = "eval.math:main"
 
 [dependency-groups]
 dev = [

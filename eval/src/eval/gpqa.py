@@ -17,7 +17,7 @@ from eval.core.model import Context
 from eval.core.utils import last_json_object
 
 DATA_SUBDIR = "GPQA"
-DATA_FILE = "diamond198.json"
+DATA_FILE = "gpqa_subset_diamond198.json"
 CHOICE_LABELS = ("A", "B", "C", "D")
 CHOICE_RE = re.compile(r"\b([ABCD])\b", re.IGNORECASE)
 ANSWER_CHOICE_RE = re.compile(r"[\"']?answer[\"']?\s*[:=]\s*[\"']?([ABCD])[\"']?", re.IGNORECASE)
@@ -120,7 +120,12 @@ def main() -> int:
     tasks = load_data(DATA_DIR / DATA_SUBDIR / DATA_FILE, args.limit)
 
     # prepare running folder
-    run_dir = runner.prepare_run_dir("GPQA", args, secrets={"api_key"})
+    run_dir = runner.prepare_run_dir(
+        "GPQA",
+        args,
+        secrets={"api_key"},
+        extra={"dataset_file": DATA_FILE, "system_prompt": SYSTEM_PROMPT},
+    )
     print(f"Running GPQA tasks with {args.model}; output: {run_dir}")
 
     # run evaluation

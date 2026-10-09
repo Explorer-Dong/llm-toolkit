@@ -110,10 +110,16 @@ async def solve(task: dict[str, Any], ctx: Context) -> dict[str, Any]:
 def main() -> int:
     # load data
     args = parse_args()
-    tasks = load_data(DATA_DIR / "AIME" / f"aime{args.year}.json", args.limit)
+    dataset_file = f"aime{args.year}.json"
+    tasks = load_data(DATA_DIR / "AIME" / dataset_file, args.limit)
 
     # prepare running folder
-    run_dir = runner.prepare_run_dir("AIME", args, secrets={"api_key"})
+    run_dir = runner.prepare_run_dir(
+        "AIME",
+        args,
+        secrets={"api_key"},
+        extra={"dataset_file": dataset_file, "system_prompt": SYSTEM_PROMPT},
+    )
     print(f"Running AIME{args.year} tasks with {args.model}; output: {run_dir}")
 
     # run evaluation

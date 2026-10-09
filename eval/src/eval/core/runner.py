@@ -63,22 +63,40 @@ async def run(
     output_path: Path,
     desc: str,
     params: ModelParams,
+    *,
+    max_active_tasks: int | None = None,
 ) -> list[dict[str, Any]]:
-    "Run every task concurrently, persisting predictions incrementally; cancels stragglers on failure."
+    "Run tasks with bounded admission and persist predictions incrementally."
 
+    if args.concurrency < 1:
+        raise ValueError("concurrency must be positive")
+    if max_active_tasks is not None and max_active_tasks < 1:
+        raise ValueError("max_active_tasks must be positive")
     client_llm = build_llm_client(api_key=args.api_key, base_url=args.base_url, timeout=args.timeout)
     ctx = Context(client_llm=client_llm, params=params, sem=asyncio.Semaphore(args.concurrency))
     records: list[dict[str, Any]] = []
-    pending = [asyncio.create_task(solve(task, ctx)) for task in tasks]
+    task_iter = iter(tasks)
+    active_limit = min(len(tasks), max_active_tasks if max_active_tasks is not None else args.concurrency)
+    pending: set[asyncio.Task[dict[str, Any]]] = set()
+    for _ in range(active_limit):
+        pending.add(asyncio.create_task(solve(next(task_iter), ctx)))
     try:
-        with tqdm(total=len(pending), desc=desc, unit="task") as progress:
-            for future in asyncio.as_completed(pending):
-                record = await future
-                records.append(record)
-                _write_predictions(output_path, records)
-                score = f"{sum(r['score'] for r in records)}/{len(records)}"
-                progress.set_postfix(score=score)
-                progress.update(1)
+        with tqdm(total=len(tasks), desc=desc, unit="task") as progress:
+            while pending:
+                completed, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for future in completed:
+                    pending.remove(future)
+                    record = await future
+                    records.append(record)
+                    _write_predictions(output_path, records)
+                    score = f"{sum(r['score'] for r in records)}/{len(records)}"
+                    progress.set_postfix(score=score)
+                    progress.update(1)
+                    try:
+                        task = next(task_iter)
+                    except StopIteration:
+                        continue
+                    pending.add(asyncio.create_task(solve(task, ctx)))
     finally:
         for future in pending:
             if not future.done():

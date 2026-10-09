@@ -2,8 +2,8 @@
 
 import asyncio
 import json
+import logging
 import re
-import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -17,6 +17,11 @@ from eval.core.model import Context, call_model
 TOOL_TIMEOUT_SEC = 60
 WEB_MAX_RETRIES = 3
 RETRY_BASE_DELAY = 3
+SEARCH_TIMEOUT = httpx.Timeout(15.0, connect=5.0, pool=5.0)
+SEARCH_LIMITS = httpx.Limits(max_connections=8, max_keepalive_connections=4, keepalive_expiry=10.0)
+RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
+
+logger = logging.getLogger(__name__)
 
 SEARCH_SCHEMA = {
     "type": "function",
@@ -77,12 +82,14 @@ class ReactResult:
 
 @asynccontextmanager
 async def web_clients() -> AsyncIterator[tuple[httpx.AsyncClient, httpx.AsyncClient]]:
-    """HTTP clients for the web tools; crawl4ai is local/LAN so it must bypass ambient proxies."""
+    """HTTP clients for the web tools; both endpoints should avoid ambient proxy settings."""
     async with (
         httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
+            timeout=SEARCH_TIMEOUT,
+            limits=SEARCH_LIMITS,
             headers={"User-Agent": "eval-harness/1.0"},
             follow_redirects=True,
+            trust_env=False,
         ) as client_search,
         httpx.AsyncClient(trust_env=False, follow_redirects=True) as client_read,
     ):
@@ -235,93 +242,92 @@ async def react(
     steps = 0
     answer: str | None = None
     sys_error: str | None = None
-    started = time.perf_counter()
-    deadline = started + task_timeout if task_timeout else None
-    timed_out = False
     schemas = [tool.schema for tool in tools]
+    timeout_scope = asyncio.timeout(task_timeout or None)
 
     try:
-        for _step in range(1, max_steps + 1):
-            if deadline is not None and time.perf_counter() >= deadline:
-                timed_out = True
-                break
-            content, calls, reasoning, call_usage, finish_reason = await call_model(
-                ctx.sem, ctx.client_llm, ctx.params, messages, tools=schemas or None
-            )
-            steps += 1
-            fold(usage, finish_reasons, call_usage, finish_reason)
+        async with timeout_scope:
+            for _step in range(1, max_steps + 1):
+                content, calls, reasoning, call_usage, finish_reason = await call_model(
+                    ctx.sem, ctx.client_llm, ctx.params, messages, tools=schemas or None
+                )
+                steps += 1
+                fold(usage, finish_reasons, call_usage, finish_reason)
 
-            if calls:
-                message: dict[str, Any] = {"role": "assistant", "content": content or None}
-                if reasoning:
-                    message["reasoning_content"] = reasoning
-                message["tool_calls"] = [
+                if calls:
+                    message: dict[str, Any] = {"role": "assistant", "content": content or None}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
+                    message["tool_calls"] = [
+                        {
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["name"],
+                                "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+                            },
+                        }
+                        for call in calls
+                    ]
+                    if call_usage:
+                        message["usage"] = call_usage
+                    messages.append(message)
+                    for call in calls:
+                        tool = next((t for t in tools if t.schema["function"]["name"] == call["name"]), None)
+                        if tool is None:
+                            observation = f"Unknown tool {call['name']!r}."
+                        else:
+                            observation = await _execute(tool, call["arguments"])
+                        messages.append({"role": "tool", "tool_call_id": call["id"], "content": observation})
+                    continue
+
+                if content:
+                    answer = content
+                    message = {"role": "assistant", "content": content}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
+                    if call_usage:
+                        message["usage"] = call_usage
+                    messages.append(message)
+                    break
+
+                messages.append(
                     {
-                        "id": call["id"],
-                        "type": "function",
-                        "function": {
-                            "name": call["name"],
-                            "arguments": json.dumps(call["arguments"], ensure_ascii=False),
-                        },
+                        "role": "user",
+                        "content": (
+                            "Your reply was empty. Call one of the tools if you need more information, "
+                            "or reply with only the final answer now."
+                        ),
                     }
-                    for call in calls
-                ]
-                if call_usage:
-                    message["usage"] = call_usage
-                messages.append(message)
-                for call in calls:
-                    tool = next((t for t in tools if t.schema["function"]["name"] == call["name"]), None)
-                    if tool is None:
-                        observation = f"Unknown tool {call['name']!r}."
-                    else:
-                        observation = await _execute(tool, call["arguments"])
-                    messages.append({"role": "tool", "tool_call_id": call["id"], "content": observation})
-                continue
+                )
 
-            if content:
-                answer = content
-                message = {"role": "assistant", "content": content}
-                if reasoning:
-                    message["reasoning_content"] = reasoning
-                if call_usage:
-                    message["usage"] = call_usage
-                messages.append(message)
-                break
-
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Your reply was empty. Call one of the tools if you need more information, "
-                        "or reply with only the final answer now."
-                    ),
-                }
-            )
-
-        if answer is None:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "No steps remain. Do not call any more tools. Reply now with only the final answer value "
-                        "itself — no reasoning, explanation, or any other text."
-                    ),
-                }
-            )
-            content, _, reasoning, call_usage, finish_reason = await call_model(
-                ctx.sem, ctx.client_llm, ctx.params, messages
-            )
-            fold(usage, finish_reasons, call_usage, finish_reason)
-            answer = content.strip() or None
-            if content:
-                message = {"role": "assistant", "content": content}
-                if reasoning:
-                    message["reasoning_content"] = reasoning
-                if call_usage:
-                    message["usage"] = call_usage
-                messages.append(message)
             if answer is None:
-                sys_error = f"task_timeout ({task_timeout}s)" if timed_out else f"max_steps_exceeded ({max_steps})"
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "No steps remain. Do not call any more tools. Reply now with only the final answer value "
+                            "itself — no reasoning, explanation, or any other text."
+                        ),
+                    }
+                )
+                content, _, reasoning, call_usage, finish_reason = await call_model(
+                    ctx.sem, ctx.client_llm, ctx.params, messages
+                )
+                fold(usage, finish_reasons, call_usage, finish_reason)
+                answer = content.strip() or None
+                if content:
+                    message = {"role": "assistant", "content": content}
+                    if reasoning:
+                        message["reasoning_content"] = reasoning
+                    if call_usage:
+                        message["usage"] = call_usage
+                    messages.append(message)
+                if answer is None:
+                    sys_error = f"max_steps_exceeded ({max_steps})"
+
+    except TimeoutError as exc:
+        sys_error = f"task_timeout ({task_timeout}s)" if timeout_scope.expired() else f"{type(exc).__name__}: {exc}"
 
     except Exception as exc:
         sys_error = f"{type(exc).__name__}: {exc}"
@@ -341,7 +347,7 @@ async def _execute(tool: Tool, arguments: dict[str, Any]) -> str:
 
 
 async def _fetch_with_retry(fetch: Callable[[], Awaitable[httpx.Response]]) -> httpx.Response:
-    "Run an HTTP call, retrying transient failures with exponential backoff."
+    "Run an HTTP call, retrying only transient transport and upstream failures."
 
     last: Exception | None = None
     for attempt in range(WEB_MAX_RETRIES):
@@ -349,6 +355,12 @@ async def _fetch_with_retry(fetch: Callable[[], Awaitable[httpx.Response]]) -> h
             await asyncio.sleep(RETRY_BASE_DELAY**attempt)
         try:
             return await fetch()
-        except httpx.HTTPError as exc:
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in RETRYABLE_STATUS_CODES:
+                raise
             last = exc
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            last = exc
+        if attempt == WEB_MAX_RETRIES - 1:
+            logger.warning("web request failed after %d attempts: %s: %s", WEB_MAX_RETRIES, type(last).__name__, last)
     raise last
