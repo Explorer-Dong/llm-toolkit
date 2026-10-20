@@ -9,18 +9,21 @@ Setup env:
 ```bash
 uv sync --group dev
 cp .env.example .env   # fill in the keys
-docker compose up -d   # crawl4ai (used by web read tool)
+docker compose up -d   # (Optional) needed only for the default fetch service Crawl4AI
 ```
 
 Start evaluation:
 
 ```bash
+# single-turn bench
 uv run aime --year 2026 --enable-thinking
 uv run gpqa --enable-thinking
-uv run gaia --enable-thinking
-uv run browsecomp --enable-thinking
-uv run webwalkerqa --enable-thinking
 uv run math --enable-thinking
+
+# multi-turn bench
+uv run browsecomp --enable-thinking
+uv run gaia --enable-thinking --search-provider deepseek --fetch-provider deepseek
+uv run webwalkerqa --enable-thinking
 
 # see more options:
 uv run <bench> --help
@@ -35,7 +38,7 @@ eval/
 ├── src/eval/
 │   ├── core/
 │   │   ├── model.py    # streaming model call, ModelParams/Context, per-call capture
-│   │   ├── harness.py  # Tool, serper key pool + search/read, ReAct loop
+│   │   ├── harness.py  # tool use and agent framework
 │   │   ├── runner.py   # run loop, run dir/config, records, summary, common CLI args
 │   │   └── utils.py    # neutral helpers shared by benchmarks
 │   ├── aime.py

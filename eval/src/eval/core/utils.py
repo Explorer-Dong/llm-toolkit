@@ -6,6 +6,26 @@ import string
 from typing import Any
 
 
+def record_model_call(
+    usage: dict[str, int],
+    finish_reasons: dict[str, int],
+    call_usage: dict[str, int] | None,
+    finish_reason: str | None,
+) -> None:
+    """Update aggregate usage and finish-reason counts for one model call."""
+    if call_usage:
+        for key in usage:
+            usage[key] += call_usage[key]
+    name = finish_reason or "unknown"
+    finish_reasons[name] = finish_reasons.get(name, 0) + 1
+
+
+def clean_text(text: str, limit: int) -> str:
+    """Collapse whitespace and truncate text to a readable limit."""
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] + (" ..." if len(text) > limit else "")
+
+
 def last_json_object(text: str) -> dict[str, Any] | None:
     "Return the last parseable JSON object embedded in text, if any."
 
