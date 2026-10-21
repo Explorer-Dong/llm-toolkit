@@ -8,14 +8,14 @@ import json
 import os
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from eval import aime, browsecomp, gaia, gpqa, math, webwalkerqa
-from eval.core import harness, model, runner
+from eval.core import harness, model, runner, scoring
 
 __all__ = []
 
@@ -30,6 +30,7 @@ TEST_ENV = {
     "JUDGE_API_KEY": "judge-secret",
 }
 PARAMS = model.ModelParams(model="test-model", temperature=0, top_p=0.95, max_tokens=8192, seed=42)
+JUDGE_PARAMS = replace(PARAMS, model="test-judge", temperature=0.0, top_p=1.0, max_tokens=4096, enable_thinking=False)
 USAGE = {"prompt_tokens": 10, "completion_tokens": 4, "reasoning_tokens": 2}
 
 
@@ -193,13 +194,17 @@ class ModelCallTests(unittest.IsolatedAsyncioTestCase):
 class QATests(unittest.IsolatedAsyncioTestCase):
     async def test_calls_model_once_and_captures_answer_and_metadata(self):
         ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
-        with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
+        with (
+            patch.object(harness, "call_model", new_callable=AsyncMock) as call,
+            patch.object(harness.time, "perf_counter", side_effect=[10.0, 11.23456]),
+        ):
             call.return_value = ("  answer\n", [], "reason", USAGE, "stop")
             result = await harness.qa(ctx, "question", system_prompt="system")
 
         self.assertIsInstance(result, harness.AgentResult)
         self.assertEqual(result.steps, 1)
-        self.assertEqual((result.answer, result.finish_reasons, result.sys_error), ("answer", {"stop": 1}, None))
+        self.assertEqual(result.latency_sec, 1.235)
+        self.assertEqual((result.final_content, result.finish_reasons, result.sys_error), ("answer", {"stop": 1}, None))
         self.assertEqual(result.usage, USAGE)
         self.assertEqual(
             result.messages,
@@ -222,7 +227,7 @@ class QATests(unittest.IsolatedAsyncioTestCase):
         with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
             call.return_value = (" \n", [], "reason", USAGE, "length")
             result = await harness.qa(ctx, "question", system_prompt="system")
-        self.assertEqual(result.answer, "")
+        self.assertEqual(result.final_content, "")
         self.assertEqual(result.usage, USAGE)
         self.assertEqual(result.finish_reasons, {"length": 1})
         self.assertEqual(result.steps, 1)
@@ -254,7 +259,7 @@ class QATests(unittest.IsolatedAsyncioTestCase):
             harness, "call_model", new_callable=AsyncMock, side_effect=RuntimeError("request failed")
         ) as call:
             result = await harness.qa(ctx, "question", system_prompt="system")
-        self.assertIsNone(result.answer)
+        self.assertIsNone(result.final_content)
         self.assertEqual(result.finish_reasons, {})
         self.assertEqual(result.steps, 0)
         self.assertEqual(result.sys_error, "RuntimeError: request failed")
@@ -271,33 +276,93 @@ class QATests(unittest.IsolatedAsyncioTestCase):
             await harness.qa(ctx, "question", system_prompt="system")
 
 
-class RecordTests(unittest.TestCase):
-    def test_keeps_fractional_score_and_extracted_prediction(self):
-        record = runner.make_record(
-            {"id": "1", "gold": "answer"},
-            extracted_prediction="prediction",
-            score=0.375,
-            usage=USAGE,
-            finish_reasons={"stop": 1},
-            latency_sec=1.23456,
-            sys_error=None,
-            messages=[],
+class SystemRecordTests(unittest.TestCase):
+    def test_serializes_agent_result_and_preserves_fractional_score(self):
+        messages = [{"role": "assistant", "content": "raw answer", "finish_reason": "stop"}]
+        result = harness.AgentResult(messages, "raw answer", dict(USAGE), {"stop": 1}, 1, None, 1.235)
+        score_result = scoring.ScoreResult("answer", "prediction", 0.375, "normalized")
+        record = runner.make_record({"id": 7}, result, score_result, subject="Algebra")
+        self.assertIsInstance(record, runner.SystemRecord)
+        self.assertIs(record.agent_result, result)
+        self.assertIs(record.score_result, score_result)
+        self.assertEqual(record.id, "7")
+        self.assertEqual(record.agent_result.latency_sec, 1.235)
+        self.assertEqual(record.agent_result.usage, USAGE)
+        self.assertEqual(record.agent_result.messages, messages)
+        self.assertEqual(record.metadata, {"subject": "Algebra"})
+        payload = json.loads(json.dumps(asdict(record)))
+        self.assertEqual(set(payload), {"id", "agent_result", "score_result", "metadata"})
+        self.assertEqual(payload["score_result"]["reference_answer"], "answer")
+        self.assertEqual(payload["score_result"]["extracted_prediction"], "prediction")
+        self.assertEqual(payload["score_result"]["score"], 0.375)
+        self.assertIsInstance(payload["score_result"]["score"], float)
+
+    def test_scoring_error_stays_with_score_without_mutating_agent(self):
+        score_result = scoring.ScoreResult("answer", "answer", 1.0, "judge", sys_error="RuntimeError: judge failed")
+        record = runner.make_record({"id": "1"}, _agent_result("answer"), score_result)
+        self.assertIsNone(record.agent_result.sys_error)
+        self.assertEqual(record.score_result.sys_error, "RuntimeError: judge failed")
+        self.assertEqual(record.score_result.score, 0.0)
+        self.assertEqual(score_result.score, 1.0)
+        self.assertEqual(runner.build_summary("test", [record], "model")["sys_errors"], 1)
+
+    def test_summary_uses_nested_scores_and_execution_errors(self):
+        good = runner.make_record(
+            {"id": "1"},
+            _agent_result("answer"),
+            scoring.ScoreResult("answer", "answer", 0.375, "normalized"),
         )
-        self.assertEqual(record["extracted_prediction"], "prediction")
-        self.assertEqual(record["score"], 0.375)
-        self.assertIsInstance(record["score"], float)
-        self.assertEqual(json.loads(json.dumps(record))["score"], 0.375)
+        failed = runner.make_record(
+            {"id": "2"},
+            _agent_result("answer", sys_error="request failed"),
+            scoring.ScoreResult("answer", "answer", 1.0, "normalized"),
+        )
+        summary = runner.build_summary("test", [good, failed], "model")
+        self.assertEqual(
+            summary,
+            {"benchmark": "test", "model": "model", "num_tasks": 2, "correct": 0.375, "score": 0.19, "sys_errors": 1},
+        )
+
+    def test_judge_usage_and_messages_stay_with_the_score(self):
+        judge_messages = [
+            {"role": "assistant", "content": "correct: yes", "usage": {"prompt_tokens": 999}, "finish_reason": "stop"}
+        ]
+        record = runner.make_record(
+            {"id": "1"},
+            _agent_result("answer"),
+            scoring.ScoreResult("answer", "answer", 1.0, "judge", judge_messages),
+        )
+        self.assertEqual(record.agent_result.usage, USAGE)
+        self.assertEqual(record.agent_result.messages, [])
+        self.assertEqual(record.score_result.messages, judge_messages)
 
 
 class GAIAAnswerTests(unittest.IsolatedAsyncioTestCase):
     def test_parses_string_answer_and_keeps_leading_zeros(self):
-        self.assertEqual(gaia._parse_answer('{"answer": " 00321 "}'), "00321")
-        self.assertEqual(gaia._parse_answer('{"answer": "Paris; 42"}'), "Paris; 42")
+        self.assertEqual(
+            scoring.verify(_agent_result('{"answer": " 00321 "}'), "321", method="normalized").extracted_prediction,
+            "00321",
+        )
+        self.assertEqual(
+            scoring.verify(
+                _agent_result('{"answer": "Paris; 42"}'), "Paris;42", method="normalized"
+            ).extracted_prediction,
+            "Paris; 42",
+        )
 
     def test_parses_fenced_json_and_numeric_answers(self):
-        self.assertEqual(gaia._parse_answer('```json\n{"answer": "Paris"}\n```'), "Paris")
-        self.assertEqual(gaia._parse_answer('{"answer": 42}'), "42")
-        self.assertEqual(gaia._parse_answer('{"answer": 1.25}'), "1.25")
+        self.assertEqual(
+            scoring.verify(
+                _agent_result('```json\n{"answer": "Paris"}\n```'), "Paris", method="normalized"
+            ).extracted_prediction,
+            "Paris",
+        )
+        self.assertEqual(
+            scoring.verify(_agent_result('{"answer": 42}'), "42", method="normalized").extracted_prediction, "42"
+        )
+        self.assertEqual(
+            scoring.verify(_agent_result('{"answer": 1.25}'), "1.25", method="normalized").extracted_prediction, "1.25"
+        )
 
     def test_rejects_missing_or_invalid_answer_fields(self):
         for content in (
@@ -311,7 +376,9 @@ class GAIAAnswerTests(unittest.IsolatedAsyncioTestCase):
             '{"answer": {"city": "Paris"}}',
         ):
             with self.subTest(content=content):
-                self.assertIsNone(gaia._parse_answer(content))
+                self.assertIsNone(
+                    scoring.verify(_agent_result(content), "Paris", method="normalized").extracted_prediction
+                )
 
     async def test_wrong_or_malformed_answers_do_not_trigger_model_extraction(self):
         ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
@@ -329,9 +396,9 @@ class GAIAAnswerTests(unittest.IsolatedAsyncioTestCase):
                         tools=[],
                         args=argparse.Namespace(max_steps=16, task_timeout=3600),
                     )
-                self.assertEqual(record["extracted_prediction"], prediction)
-                self.assertEqual(record["score"], 0.0)
-                self.assertIsNone(record["sys_error"])
+                self.assertEqual(record.score_result.extracted_prediction, prediction)
+                self.assertEqual(record.score_result.score, 0.0)
+                self.assertIsNone(record.agent_result.sys_error)
                 self.assertEqual(result.messages, [])
                 call.assert_not_awaited()
                 direct_call.assert_not_awaited()
@@ -377,7 +444,10 @@ class ReactFormatTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_final_request_preserves_the_system_output_format(self):
         ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
-        with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
+        with (
+            patch.object(harness, "call_model", new_callable=AsyncMock) as call,
+            patch.object(harness.time, "perf_counter", side_effect=[20.0, 22.34567]),
+        ):
             call.return_value = ('{"answer": "Paris"}', [], "", USAGE, "stop")
             result = await harness.react(
                 ctx,
@@ -387,7 +457,8 @@ class ReactFormatTests(unittest.IsolatedAsyncioTestCase):
                 max_steps=0,
                 task_timeout=1,
             )
-        self.assertEqual(result.answer, '{"answer": "Paris"}')
+        self.assertEqual(result.final_content, '{"answer": "Paris"}')
+        self.assertEqual(result.latency_sec, 2.346)
         self.assertEqual(result.steps, 1)
         self.assertEqual(result.messages[-1]["finish_reason"], "stop")
         self.assertIsNone(result.sys_error)
@@ -396,17 +467,111 @@ class ReactFormatTests(unittest.IsolatedAsyncioTestCase):
 
 
 class JudgeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_browsecomp_failed_stream_is_closed_and_error_propagates(self):
+    async def test_failed_stream_is_closed_and_error_is_recorded(self):
         client, stream = _make_client([], error=RuntimeError("judge stream failed"))
-        with self.assertRaisesRegex(RuntimeError, "judge stream failed"):
-            await browsecomp.scorer(asyncio.Semaphore(1), client, "judge", "question", "prediction", "gold")
+        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
+        result = await scoring.judge(ctx, _agent_result("prediction"), "gold", question="question")
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(result.sys_error, "RuntimeError: judge stream failed")
+        self.assertEqual(len(result.messages), 1)
         stream.close.assert_awaited_once()
 
-    async def test_webwalkerqa_failed_stream_is_closed_and_error_propagates(self):
-        client, stream = _make_client([], error=RuntimeError("judge stream failed"))
-        with self.assertRaisesRegex(RuntimeError, "judge stream failed"):
-            await webwalkerqa.scorer(asyncio.Semaphore(1), client, "judge", "question", "prediction", "gold")
+    async def test_uses_shared_model_call_and_keeps_full_judge_trace(self):
+        content = "extracted_final_answer: Paris\nreasoning: " + "x" * 2400 + "\ncorrect: YES"
+        client, stream = _make_client(
+            [
+                _chunk(content=content, reasoning_content="judge reasoning", finish_reason="stop"),
+                SimpleNamespace(
+                    choices=[],
+                    usage=SimpleNamespace(
+                        prompt_tokens=10,
+                        completion_tokens=4,
+                        completion_tokens_details=SimpleNamespace(reasoning_tokens=2),
+                    ),
+                ),
+            ]
+        )
+        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
+        with patch.object(scoring, "call_model", wraps=model.call_model) as call:
+            result = await scoring.judge(ctx, _agent_result("The capital is Paris."), "Paris", question="Capital?")
+        self.assertIsInstance(result, scoring.ScoreResult)
+        self.assertEqual(
+            (result.reference_answer, result.extracted_prediction, result.score, result.method),
+            ("Paris", "Paris", 1.0, "judge"),
+        )
+        self.assertIsInstance(result.score, float)
+        self.assertIsNone(result.sys_error)
+        self.assertEqual(
+            result.messages[-1],
+            {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": "judge reasoning",
+                "usage": USAGE,
+                "finish_reason": "stop",
+            },
+        )
+        call.assert_awaited_once_with(ctx.sem, client, ctx.params, result.messages)
+        request = client.chat.completions.create.call_args.kwargs
+        self.assertEqual(
+            request["messages"],
+            [
+                {
+                    "role": "user",
+                    "content": scoring.JUDGE_PROMPT.format(
+                        question="Capital?", response="The capital is Paris.", correct_answer="Paris"
+                    ),
+                }
+            ],
+        )
+        self.assertEqual((request["model"], request["temperature"], request["max_tokens"]), ("test-judge", 0, 4096))
+        self.assertEqual(request["extra_body"], {"chat_template_kwargs": {"enable_thinking": False}})
+        self.assertEqual(request["stream_options"], {"include_usage": True})
         stream.close.assert_awaited_once()
+
+    async def test_no_verdict_keeps_the_response_and_records_error(self):
+        client, stream = _make_client([_chunk(content="no verdict", finish_reason="length")])
+        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
+        result = await scoring.judge(ctx, _agent_result("prediction"), "gold", question="question")
+        self.assertEqual(result.score, 0.0)
+        self.assertIn("ValueError: judge returned no verdict", result.sys_error or "")
+        self.assertEqual(result.messages[-1]["content"], "no verdict")
+        self.assertEqual(result.messages[-1]["finish_reason"], "length")
+        stream.close.assert_awaited_once()
+
+    async def test_no_answer_extracted_is_distinct_from_raw_prediction(self):
+        client, _ = _make_client([_chunk(content="extracted_final_answer: None\nreasoning: No answer.\ncorrect: no")])
+        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
+        result = await scoring.judge(ctx, _agent_result("I do not know."), "gold", question="question")
+        self.assertEqual(result.score, 0.0)
+        self.assertIsNone(result.extracted_prediction)
+        self.assertEqual(result.messages[-1]["finish_reason"], "unknown")
+
+    async def test_agent_failure_does_not_start_judging(self):
+        client, _ = _make_client([])
+        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
+        result = await scoring.judge(
+            ctx, _agent_result("partial", sys_error="task_timeout"), "gold", question="question"
+        )
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(result.messages, [])
+        client.chat.completions.create.assert_not_awaited()
+
+    async def test_missing_final_content_does_not_start_judging(self):
+        client, _ = _make_client([])
+        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
+        result = await scoring.judge(ctx, _agent_result(None), "gold", question="question")
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(result.messages, [])
+        client.chat.completions.create.assert_not_awaited()
+
+    async def test_task_cancellation_propagates(self):
+        ctx = model.Context(MagicMock(), JUDGE_PARAMS, asyncio.Semaphore(1))
+        with (
+            patch.object(scoring, "call_model", new_callable=AsyncMock, side_effect=asyncio.CancelledError),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await scoring.judge(ctx, _agent_result("prediction"), "gold", question="question")
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
@@ -426,7 +591,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             peak = max(peak, active)
             await asyncio.sleep(0)
             active -= 1
-            return {"id": task["id"], "score": 1, "sys_error": None}
+            return _make_record(task["id"])
 
         with (
             tempfile.TemporaryDirectory() as temp,
@@ -437,10 +602,10 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             records = await runner.run(
                 args, [{"id": str(i)} for i in range(4)], solve_task, path, "test", max_active_tasks=2
             )
-            self.assertEqual(json.loads(path.read_text()), records)
+            self.assertEqual(json.loads(path.read_text()), [asdict(record) for record in records])
             self.assertFalse(path.with_suffix(".json.tmp").exists())
         self.assertEqual(peak, 2)
-        self.assertEqual({record["id"] for record in records}, {"0", "1", "2", "3"})
+        self.assertEqual({record.id for record in records}, {"0", "1", "2", "3"})
         self.assertTrue(all(ctx.params.extra_body == {"top_k": 7} for ctx in contexts))
         client.close.assert_awaited_once()
 
@@ -524,7 +689,7 @@ class RunnerResourceTests(unittest.IsolatedAsyncioTestCase):
             tool_scope.__aexit__.assert_not_awaited()
             if failure == "task":
                 raise RuntimeError("task failed")
-            return {"id": task["id"], "score": 1, "sys_error": None}
+            return _make_record(task["id"])
 
         solver = AsyncMock(side_effect=solve_task)
         clients = [client, RuntimeError("judge failed") if failure == "judge" else judge]
@@ -573,7 +738,11 @@ class RunnerResourceTests(unittest.IsolatedAsyncioTestCase):
                     if use_tools:
                         expected["tools"] = tools
                     if use_judge:
-                        expected["judge"] = judge
+                        judge_ctx = call.kwargs["judge_ctx"]
+                        self.assertIs(judge_ctx.client_llm, judge)
+                        self.assertIs(judge_ctx.sem, call.args[1].sem)
+                        self.assertEqual(judge_ctx.params, JUDGE_PARAMS)
+                        expected["judge_ctx"] = judge_ctx
                     self.assertEqual(call.kwargs, expected)
         client.close.assert_awaited_once()
         if use_judge and failure != "judge":
@@ -594,35 +763,13 @@ class BenchmarkScoringTests(unittest.IsolatedAsyncioTestCase):
         task = {"id": "1", "problem": "1+1?", "gold": "2", "subject": "Algebra", "level": 1}
         await self._assert_single_turn(math, task, r"\boxed{2}", "2")
 
-    async def test_browsecomp_judge_formats_prompt_and_reads_yes(self):
-        client, stream = _make_client([_chunk(content="correct: YES")])
-        result = await browsecomp.scorer(asyncio.Semaphore(1), client, "test-judge", "question", "answer", "gold")
-        self.assertEqual(result, (True, "correct: YES"))
-        request = client.chat.completions.create.call_args.kwargs
-        self.assertEqual(
-            request["messages"],
-            [
-                {
-                    "role": "user",
-                    "content": browsecomp.JUDGE_PROMPT.format(
-                        question="question", response="answer", correct_answer="gold"
-                    ),
-                }
-            ],
-        )
-        self.assertEqual((request["model"], request["temperature"], request["max_tokens"]), ("test-judge", 0, 4096))
-        self.assertEqual(request["extra_body"], {"chat_template_kwargs": {"enable_thinking": False}})
-        stream.close.assert_awaited_once()
+    async def test_browsecomp_records_shared_judge_score_and_errors(self):
+        task = {"id": "1", "question": "Capital?", "gold": "Paris", "topic": "Geography"}
+        await self._assert_judged_task(browsecomp, task)
 
-    async def test_webwalkerqa_judge_reads_no_and_rejects_missing_verdict(self):
-        client, stream = _make_client([_chunk(content="correct: no")])
-        result = await webwalkerqa.scorer(asyncio.Semaphore(1), client, "test-judge", "q", "p", "g")
-        self.assertEqual(result, (False, "correct: no"))
-        stream.close.assert_awaited_once()
-        client, stream = _make_client([_chunk(content="no verdict")])
-        with self.assertRaisesRegex(ValueError, "judge returned no verdict"):
-            await webwalkerqa.scorer(asyncio.Semaphore(1), client, "test-judge", "q", "p", "g")
-        stream.close.assert_awaited_once()
+    async def test_webwalkerqa_records_shared_judge_score_and_errors(self):
+        task = {"id": "1", "question": "Capital?", "gold": "Paris", "type": "single_source", "difficulty": "easy"}
+        await self._assert_judged_task(webwalkerqa, task)
 
     async def test_gaia_json_answer_preserves_raw_content_and_usage_counts(self):
         content = ' {"answer": "Paris"} '
@@ -640,26 +787,50 @@ class BenchmarkScoringTests(unittest.IsolatedAsyncioTestCase):
                 tools=[],
                 args=argparse.Namespace(max_steps=16, task_timeout=3600),
             )
-        self.assertEqual((record["score"], record["extracted_prediction"]), (1.0, "Paris"))
-        self.assertIsInstance(record["score"], float)
-        self.assertEqual(record["messages"], messages)
-        self.assertEqual(record["messages"][-1]["content"], content)
-        self.assertEqual(record["finish_reasons"], {"stop": 1})
-        self.assertEqual({key: record[key] for key in USAGE}, USAGE)
+        self.assertEqual((record.score_result.score, record.score_result.extracted_prediction), (1.0, "Paris"))
+        self.assertIsInstance(record.score_result.score, float)
+        self.assertEqual(record.agent_result.messages, messages)
+        self.assertEqual(record.agent_result.messages[-1]["content"], content)
+        self.assertEqual(record.agent_result.finish_reasons, {"stop": 1})
+        self.assertEqual({key: record.agent_result.usage[key] for key in USAGE}, USAGE)
         call.assert_not_awaited()
         direct_call.assert_not_awaited()
+
+    async def _assert_judged_task(self, module, task):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        result = harness.AgentResult([], "Paris", dict(USAGE), {"stop": 1}, 1, None)
+        client, stream = _make_client([_chunk(content="correct: yes")])
+        args = argparse.Namespace(max_steps=16, task_timeout=3600)
+        judge_ctx = model.Context(client, JUDGE_PARAMS, ctx.sem)
+        with patch.object(harness, "react", new_callable=AsyncMock, return_value=result):
+            record = await module.solve_task(task, ctx, tools=[], judge_ctx=judge_ctx, args=args)
+            self.assertEqual((record.score_result.extracted_prediction, record.score_result.score), ("Paris", 1.0))
+            self.assertEqual(record.score_result.messages[-1]["content"], "correct: yes")
+            self.assertIsNone(record.agent_result.sys_error)
+            stream.close.assert_awaited_once()
+            client.chat.completions.create.side_effect = RuntimeError("judge unavailable")
+            record = await module.solve_task(task, ctx, tools=[], judge_ctx=judge_ctx, args=args)
+            self.assertEqual(record.score_result.score, 0.0)
+            self.assertIsNone(record.agent_result.sys_error)
+            self.assertEqual(record.score_result.sys_error, "RuntimeError: judge unavailable")
+            result.sys_error = "task_timeout (3600s)"
+            client.chat.completions.create.reset_mock()
+            record = await module.solve_task(task, ctx, tools=[], judge_ctx=judge_ctx, args=args)
+            self.assertEqual(record.score_result.score, 0.0)
+            self.assertEqual(record.agent_result.sys_error, result.sys_error)
+            client.chat.completions.create.assert_not_awaited()
 
     async def _assert_single_turn(self, module, task, content, extracted):
         ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
         with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
             call.return_value = (f" {content} ", [], "reason", USAGE, "stop")
             record = await module.solve_task(task, ctx)
-            self.assertEqual((record["score"], record["extracted_prediction"]), (1.0, extracted))
-            self.assertIsInstance(record["score"], float)
-            self.assertEqual(record["finish_reasons"], {"stop": 1})
-            self.assertEqual(record["steps"], 1)
+            self.assertEqual((record.score_result.score, record.score_result.extracted_prediction), (1.0, extracted))
+            self.assertIsInstance(record.score_result.score, float)
+            self.assertEqual(record.agent_result.finish_reasons, {"stop": 1})
+            self.assertEqual(record.agent_result.steps, 1)
             self.assertEqual(
-                record["messages"][-1],
+                record.agent_result.messages[-1],
                 {
                     "role": "assistant",
                     "content": f" {content} ",
@@ -668,12 +839,25 @@ class BenchmarkScoringTests(unittest.IsolatedAsyncioTestCase):
                     "finish_reason": "stop",
                 },
             )
-            self.assertEqual({key: record[key] for key in USAGE}, USAGE)
+            self.assertEqual({key: record.agent_result.usage[key] for key in USAGE}, USAGE)
             call.side_effect = RuntimeError("request failed")
             record = await module.solve_task(task, ctx)
-            self.assertEqual(record["score"], 0)
-            self.assertEqual(record["sys_error"], "RuntimeError: request failed")
-            self.assertEqual(len(record["messages"]), 2)
+            self.assertEqual(record.score_result.score, 0)
+            self.assertEqual(record.agent_result.sys_error, "RuntimeError: request failed")
+            self.assertEqual(len(record.agent_result.messages), 2)
+
+
+def _agent_result(final_content, *, sys_error=None):
+    return harness.AgentResult([], final_content, dict(USAGE), {"stop": 1}, 1, sys_error)
+
+
+def _make_record(task_id, **metadata):
+    return runner.make_record(
+        {"id": task_id},
+        _agent_result("answer"),
+        scoring.ScoreResult("answer", "answer", 1.0, "integer"),
+        **metadata,
+    )
 
 
 def _run_main(module, flags):
@@ -683,16 +867,7 @@ def _run_main(module, flags):
         else []
     )
     client = MagicMock(close=AsyncMock())
-    record = {
-        "id": "1",
-        "score": 1,
-        "sys_error": None,
-        "topic": "test",
-        "level": 1,
-        "subject": "Algebra",
-        "type": "single_source",
-        "difficulty": "easy",
-    }
+    record = _make_record("1", topic="test", level=1, subject="Algebra", type="single_source", difficulty="easy")
     with (
         tempfile.TemporaryDirectory() as temp,
         patch.dict(os.environ, TEST_ENV, clear=True),
@@ -708,7 +883,7 @@ def _run_main(module, flags):
         contextlib.redirect_stderr(io.StringIO()),
     ):
         module.main()
-    return context.call_args.kwargs["params"]
+    return context.call_args_list[0].kwargs["params"]
 
 
 def _chunk(*, content=None, reasoning=None, reasoning_content=None, calls=(), finish_reason=None):

@@ -43,6 +43,7 @@ eval/
 │   │   ├── harness.py  # tools, agent paradigms
 │   │   ├── model.py    # model CLI args, request parameters, streaming model calls
 │   │   ├── runner.py   # before eval (prepare folder), during eval (asynchronous run, record result), after eval (summary)
+│   │   ├── scoring.py  # score agent answer with formal verification and LLM judging
 │   │   └── utils.py    # shared helpers
 │   ├── aime.py
 │   ├── browsecomp.py
@@ -55,10 +56,5 @@ per benchmark module include:
 
 - `parse_args`: arguments parser
 - `load_tasks`: data loader
-- `scorer`: score the prediction against the ground truth
 - `solve_task`: solver of one sample
 - `main`: running control
-
-GAIA requests a JSON final answer such as `{"answer": "..."}` and parses it locally without another model request. Records store the parsed value in `extracted_prediction`, retain raw responses in `messages`, and use floating-point scores.
-
-Both `qa` and `react` return `AgentResult`, with aggregate `usage`, `finish_reasons`, and a `steps` count of completed model responses. Every assistant message records its own `finish_reason` (`"unknown"` when unavailable); this log-only field is excluded from subsequent model requests.

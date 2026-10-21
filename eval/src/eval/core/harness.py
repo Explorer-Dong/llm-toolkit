@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -34,6 +35,22 @@ _RETRY_BASE_DELAY = 3
 _HTTP_TIMEOUT = httpx.Timeout(15.0, connect=5.0, pool=5.0)
 _HTTP_LIMITS = httpx.Limits(max_connections=8, max_keepalive_connections=4, keepalive_expiry=10.0)
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, *range(500, 600)})
+# DeepSeek Search / Fetch API error descriptions:
+# https://api-docs.deepseek.com/guides/search/#errors
+_DEEPSEEK_OBSERVABLE_ERRORS = {
+    403: "The Fetch request was rejected by the security policy.",
+    404: (
+        "Fetch could not retrieve usable page content, for example due to an unavailable URL, "
+        "a URL blocked by site policy, an error from the target site, an unsupported content type, "
+        "or a page with no extractable Markdown content."
+    ),
+    413: "The request body is too large.",
+}
+_DEVELOPER_HTTP_ERRORS = {
+    400: "Invalid request headers or body. Check the request format and field values.",
+    401: "Missing or invalid API key. Check the tool credentials.",
+    402: "Insufficient account balance. Top up the tool account before retrying.",
+}
 _logger = logging.getLogger(__name__)
 
 
@@ -76,6 +93,7 @@ class Tool:
     key: str
     run: Callable[[str], Awaitable[str]]
     timeout: float = _TOOL_TIMEOUT_SEC
+    provider: str = ""
 
 
 @dataclass
@@ -83,11 +101,12 @@ class AgentResult:
     """One agent episode and its call metadata; scoring stays with the benchmark."""
 
     messages: list[dict[str, Any]]
-    answer: str | None
+    final_content: str | None
     usage: dict[str, int]
     finish_reasons: dict[str, int]
     steps: int
     sys_error: str | None
+    latency_sec: float = 0.0
 
 
 def add_tool_args(parser: argparse.ArgumentParser) -> None:
@@ -152,12 +171,13 @@ async def qa(
 ) -> AgentResult:
     """Harness with QA paradigm."""
 
+    started = time.perf_counter()
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": question},
     ]
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}
-    answer: str | None = None
+    final_content: str | None = None
     finish_reasons: dict[str, int] = {}
     steps = 0
     sys_error: str | None = None
@@ -171,7 +191,7 @@ async def qa(
                 usage[key] += call_usage[key]
         finish_reason = finish_reason or "unknown"
         finish_reasons[finish_reason] = finish_reasons.get(finish_reason, 0) + 1
-        answer = content.strip()
+        final_content = content.strip()
         messages.append(
             {
                 "role": "assistant",
@@ -184,7 +204,9 @@ async def qa(
     except Exception as exc:
         sys_error = f"{type(exc).__name__}: {exc}"
 
-    return AgentResult(messages, answer, usage, finish_reasons, steps, sys_error)
+    return AgentResult(
+        messages, final_content, usage, finish_reasons, steps, sys_error, round(time.perf_counter() - started, 3)
+    )
 
 
 async def react(
@@ -198,6 +220,7 @@ async def react(
 ) -> AgentResult:
     "Harness with ReAct paradigm."
 
+    started = time.perf_counter()
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": question},
@@ -205,7 +228,7 @@ async def react(
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}
     finish_reasons: dict[str, int] = {}
     steps = 0
-    answer: str | None = None
+    final_content: str | None = None
     sys_error: str | None = None
     schemas = [tool.schema for tool in tools]
     timeout_scope = asyncio.timeout(task_timeout or None)
@@ -258,7 +281,7 @@ async def react(
                     continue
 
                 if content:
-                    answer = content
+                    final_content = content
                     break
 
                 messages.append(
@@ -271,7 +294,7 @@ async def react(
                     }
                 )
 
-            if answer is None:
+            if final_content is None:
                 messages.append(
                     {
                         "role": "user",
@@ -290,14 +313,14 @@ async def react(
                         usage[key] += call_usage[key]
                 finish_reason = finish_reason or "unknown"
                 finish_reasons[finish_reason] = finish_reasons.get(finish_reason, 0) + 1
-                answer = content.strip() or None
+                final_content = content.strip() or None
                 message = {"role": "assistant", "content": content, "finish_reason": finish_reason}
                 if reasoning_content:
                     message["reasoning_content"] = reasoning_content
                 if call_usage:
                     message["usage"] = call_usage
                 messages.append(message)
-                if answer is None:
+                if final_content is None:
                     sys_error = f"max_steps_exceeded ({max_steps})"
 
     except TimeoutError as exc:
@@ -306,7 +329,43 @@ async def react(
     except Exception as exc:
         sys_error = f"{type(exc).__name__}: {exc}"
 
-    return AgentResult(messages, answer, usage, finish_reasons, steps, sys_error)
+    return AgentResult(
+        messages, final_content, usage, finish_reasons, steps, sys_error, round(time.perf_counter() - started, 3)
+    )
+
+
+async def _execute_tool(tool: Tool, arguments: dict[str, Any]) -> str:
+    """Return actionable observations; report developer errors and stop the episode."""
+    value = str(arguments.get(tool.key, arguments.get("input", "")))
+    try:
+        return await asyncio.wait_for(tool.run(value), tool.timeout)
+    except TimeoutError:
+        return f"The tool call timed out after {tool.timeout}s. Try another source."
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if tool.provider == "deepseek" and status in _DEEPSEEK_OBSERVABLE_ERRORS:
+            return _DEEPSEEK_OBSERVABLE_ERRORS[status]
+        if status in _RETRYABLE_STATUS_CODES:
+            return "The tool service is temporarily unavailable after retries. Try another source."
+        detail = exc.response.text
+        for header in ("Authorization", "X-API-KEY"):
+            secret = exc.request.headers.get(header, "").removeprefix("Bearer ").strip()
+            if secret:
+                detail = detail.replace(secret, "[redacted]")
+        _logger.error(
+            "%s %s failed (HTTP %d): %s Server response: %s",
+            tool.provider or "Tool",
+            tool.schema["function"]["name"],
+            status,
+            _DEVELOPER_HTTP_ERRORS.get(status, exc.response.reason_phrase),
+            clean_text(detail, 2000),
+        )
+        raise
+    except (httpx.TimeoutException, httpx.NetworkError):
+        return "The tool service could not be reached after retries. Try another source."
+    except Exception:
+        _logger.exception("%s %s failed", tool.provider or "Tool", tool.schema["function"]["name"])
+        raise
 
 
 def _make_serper_search(client: httpx.AsyncClient, api_key: str, limit: int, clean_limit: int) -> Tool:
@@ -375,7 +434,7 @@ def _make_serper_search(client: httpx.AsyncClient, api_key: str, limit: int, cle
 
         return "Tool error: every serper API key is out of credits."
 
-    return Tool(SEARCH_SCHEMA, "query", run)
+    return Tool(SEARCH_SCHEMA, "query", run, provider="serper")
 
 
 def _make_crawl4ai_fetch(client: httpx.AsyncClient, server: str, token: str, clean_limit: int) -> Tool:
@@ -408,7 +467,7 @@ def _make_crawl4ai_fetch(client: httpx.AsyncClient, server: str, token: str, cle
         text = clean_text(markdown, clean_limit)
         return text or "The page contained no readable text."
 
-    return Tool(FETCH_SCHEMA, "url", run)
+    return Tool(FETCH_SCHEMA, "url", run, provider="crawl4ai")
 
 
 def _make_deepseek_search(client: httpx.AsyncClient, server: str, api_key: str, limit: int, clean_limit: int) -> Tool:
@@ -443,7 +502,7 @@ def _make_deepseek_search(client: httpx.AsyncClient, server: str, api_key: str, 
             return "No search results were returned. Try a different query."
         return clean_text(json.dumps(results, ensure_ascii=False, indent=2), clean_limit)
 
-    return Tool(SEARCH_SCHEMA, "query", run)
+    return Tool(SEARCH_SCHEMA, "query", run, provider="deepseek")
 
 
 def _make_deepseek_fetch(client: httpx.AsyncClient, server: str, api_key: str, clean_limit: int) -> Tool:
@@ -465,7 +524,7 @@ def _make_deepseek_fetch(client: httpx.AsyncClient, server: str, api_key: str, c
         payload = response.json()
         return clean_text(payload["content"], clean_limit) or "The page contained no readable text."
 
-    return Tool(FETCH_SCHEMA, "url", run)
+    return Tool(FETCH_SCHEMA, "url", run, provider="deepseek")
 
 
 async def _http_request_with_retry(
@@ -495,14 +554,3 @@ async def _http_request_with_retry(
                 "tool request failed after %d attempts: %s: %s", _TOOL_MAX_RETRIES, type(last).__name__, last
             )
     raise last
-
-
-async def _execute_tool(tool: Tool, arguments: dict[str, Any]) -> str:
-    "Run one tool call; failures become observations, never exceptions."
-    value = str(arguments.get(tool.key, arguments.get("input", "")))
-    try:
-        return await asyncio.wait_for(tool.run(value), tool.timeout)
-    except TimeoutError:
-        return f"Tool error: the call was cancelled after exceeding {tool.timeout}s."
-    except Exception as exc:  # noqa: BLE001 - tool failures become observations
-        return f"Tool error: {type(exc).__name__}: {exc}"
