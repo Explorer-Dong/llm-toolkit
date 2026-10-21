@@ -64,7 +64,7 @@ class ModelArgsTests(unittest.TestCase):
 class AgentArgsTests(unittest.TestCase):
     def test_agent_defaults_and_overrides(self):
         parser = argparse.ArgumentParser()
-        harness.add_agent_args(parser)
+        harness.add_paradigm_args(parser)
         args = parser.parse_args([])
         self.assertEqual(
             (args.max_steps, args.search_results, args.observation_chars, args.task_timeout), (16, 8, 12000, 3600)
@@ -87,7 +87,7 @@ class AgentArgsTests(unittest.TestCase):
 
     def test_search_result_limits_are_checked_by_argparse(self):
         parser = argparse.ArgumentParser()
-        harness.add_agent_args(parser)
+        harness.add_paradigm_args(parser)
         for value in ("0", "51", "invalid"):
             with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as exc:
@@ -181,6 +181,68 @@ class ModelCallTests(unittest.IsolatedAsyncioTestCase):
         stream.close.assert_awaited_once()
 
 
+class QATests(unittest.IsolatedAsyncioTestCase):
+    async def test_calls_model_once_and_captures_answer_and_metadata(self):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
+            call.return_value = ("  answer\n", [], "reason", USAGE, "stop")
+            result = await harness.qa(ctx, "question", system_prompt="system")
+
+        self.assertIsInstance(result, harness.QAResult)
+        self.assertEqual((result.answer, result.finish_reason, result.sys_error), ("answer", "stop", None))
+        self.assertEqual(result.usage, USAGE)
+        self.assertEqual(
+            result.messages,
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": "answer", "reasoning_content": "reason", "usage": USAGE},
+            ],
+        )
+        call.assert_awaited_once_with(ctx.sem, ctx.client_llm, ctx.params, result.messages)
+
+    async def test_empty_answer_keeps_usage_without_adding_an_assistant_message(self):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
+            call.return_value = (" \n", [], "reason", USAGE, "length")
+            result = await harness.qa(ctx, "question", system_prompt="system")
+        self.assertEqual(result.answer, "")
+        self.assertEqual(result.usage, USAGE)
+        self.assertEqual(result.finish_reason, "length")
+        self.assertIsNone(result.sys_error)
+        self.assertEqual(len(result.messages), 2)
+        call.assert_awaited_once()
+
+    async def test_missing_usage_and_reasoning_remain_optional(self):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        with patch.object(harness, "call_model", new_callable=AsyncMock, return_value=("answer", [], "", None, None)):
+            result = await harness.qa(ctx, "question", system_prompt="system")
+        self.assertEqual(result.usage, dict.fromkeys(USAGE, 0))
+        self.assertIsNone(result.finish_reason)
+        self.assertEqual(result.messages[-1], {"role": "assistant", "content": "answer"})
+
+    async def test_request_error_is_recorded_without_a_fallback_request(self):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        with patch.object(
+            harness, "call_model", new_callable=AsyncMock, side_effect=RuntimeError("request failed")
+        ) as call:
+            result = await harness.qa(ctx, "question", system_prompt="system")
+        self.assertIsNone(result.answer)
+        self.assertIsNone(result.finish_reason)
+        self.assertEqual(result.sys_error, "RuntimeError: request failed")
+        self.assertEqual(result.usage, dict.fromkeys(USAGE, 0))
+        self.assertEqual(len(result.messages), 2)
+        call.assert_awaited_once()
+
+    async def test_task_cancellation_propagates(self):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        with (
+            patch.object(harness, "call_model", new_callable=AsyncMock, side_effect=asyncio.CancelledError),
+            self.assertRaises(asyncio.CancelledError),
+        ):
+            await harness.qa(ctx, "question", system_prompt="system")
+
+
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_builds_model_params_limits_tasks_and_persists_predictions(self):
         parser = argparse.ArgumentParser()
@@ -191,7 +253,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         peak = 0
         contexts = []
 
-        async def solve(task, ctx):
+        async def solve_task(task, ctx):
             nonlocal active, peak
             contexts.append(ctx)
             active += 1
@@ -207,7 +269,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         ):
             path = Path(temp) / "predictions.json"
             records = await runner.run(
-                args, [{"id": str(i)} for i in range(4)], solve, path, "test", max_active_tasks=2
+                args, [{"id": str(i)} for i in range(4)], solve_task, path, "test", max_active_tasks=2
             )
             self.assertEqual(json.loads(path.read_text()), records)
             self.assertFalse(path.with_suffix(".json.tmp").exists())
@@ -224,7 +286,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
-        async def solve(task, ctx):
+        async def solve_task(task, ctx):
             if task["id"] == "fail":
                 await started.wait()
                 raise RuntimeError("task failed")
@@ -241,7 +303,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             contextlib.redirect_stderr(io.StringIO()),
             self.assertRaisesRegex(RuntimeError, "task failed"),
         ):
-            await runner.run(args, [{"id": "fail"}, {"id": "wait"}], solve, Path(temp) / "out.json", "test")
+            await runner.run(args, [{"id": "fail"}, {"id": "wait"}], solve_task, Path(temp) / "out.json", "test")
         self.assertTrue(cancelled.is_set())
         client.close.assert_awaited_once()
 
@@ -254,6 +316,104 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
                     argparse.Namespace(concurrency=1), [], AsyncMock(), Path("unused.json"), "test", max_active_tasks=0
                 )
         build.assert_not_called()
+
+
+class RunnerResourceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tools_are_shared_by_tasks_and_closed_after_completion(self):
+        await self._assert_resources(use_tools=True)
+
+    async def test_tools_and_judge_are_shared_and_closed_after_completion(self):
+        await self._assert_resources(use_tools=True, use_judge=True)
+
+    async def test_judge_can_be_used_without_tools(self):
+        await self._assert_resources(use_judge=True)
+
+    async def test_task_failure_closes_tools_and_both_model_clients(self):
+        await self._assert_resources(use_tools=True, use_judge=True, failure="task")
+
+    async def test_tool_setup_failure_closes_every_acquired_resource(self):
+        await self._assert_resources(use_tools=True, use_judge=True, failure="tools")
+
+    async def test_judge_setup_failure_closes_primary_model_client(self):
+        await self._assert_resources(use_tools=True, use_judge=True, failure="judge")
+
+    async def _assert_resources(self, *, use_tools=False, use_judge=False, failure=None):
+        parser = argparse.ArgumentParser()
+        with patch.dict(os.environ, TEST_ENV, clear=True):
+            model.add_model_args(parser, include_judge=use_judge)
+            harness.add_tool_args(parser)
+            harness.add_paradigm_args(parser)
+        args = parser.parse_args([])
+        client = MagicMock(close=AsyncMock())
+        judge = MagicMock(close=AsyncMock())
+        tool_scope = MagicMock()
+        tool_clients = (MagicMock(), MagicMock())
+        tool_scope.__aenter__.return_value = tool_clients
+        tool_scope.__aexit__.return_value = False
+        tools = [MagicMock()]
+
+        async def solve_task(task, ctx, **kwargs):
+            client.close.assert_not_awaited()
+            judge.close.assert_not_awaited()
+            tool_scope.__aexit__.assert_not_awaited()
+            if failure == "task":
+                raise RuntimeError("task failed")
+            return {"id": task["id"], "score": 1, "sys_error": None}
+
+        solver = AsyncMock(side_effect=solve_task)
+        clients = [client, RuntimeError("judge failed") if failure == "judge" else judge]
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(runner, "build_llm_client", side_effect=clients) as build_client,
+            patch.object(harness, "tool_clients", return_value=tool_scope) as open_tools,
+            patch.object(harness, "make_tools", return_value=tools) as make_tools,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            if failure == "tools":
+                make_tools.side_effect = RuntimeError("tools failed")
+            with self.assertRaisesRegex(RuntimeError, f"{failure} failed") if failure else contextlib.nullcontext():
+                await runner.run(
+                    args,
+                    [{"id": "1"}, {"id": "2"}],
+                    solver,
+                    Path(temp) / "predictions.json",
+                    "test",
+                    use_tools=use_tools,
+                    use_judge=use_judge,
+                )
+            self.assertEqual(build_client.call_count, 2 if use_judge else 1)
+            if use_judge:
+                self.assertEqual(
+                    build_client.call_args.kwargs,
+                    {
+                        "api_key": "judge-secret",
+                        "base_url": TEST_ENV["JUDGE_BASE_URL"],
+                        "timeout": args.timeout,
+                    },
+                )
+            if use_tools and failure != "judge":
+                open_tools.assert_called_once_with()
+                make_tools.assert_called_once_with(*tool_clients, args)
+                tool_scope.__aexit__.assert_awaited_once()
+            else:
+                open_tools.assert_not_called()
+                make_tools.assert_not_called()
+            if failure in ("tools", "judge"):
+                solver.assert_not_awaited()
+            else:
+                for call in solver.await_args_list:
+                    self.assertIs(call.args[1].client_llm, client)
+                    expected = {"args": args}
+                    if use_tools:
+                        expected["tools"] = tools
+                    if use_judge:
+                        expected["judge"] = judge
+                    self.assertEqual(call.kwargs, expected)
+        client.close.assert_awaited_once()
+        if use_judge and failure != "judge":
+            judge.close.assert_awaited_once()
+        else:
+            judge.close.assert_not_awaited()
 
 
 class BenchmarkScoringTests(unittest.IsolatedAsyncioTestCase):
@@ -314,7 +474,7 @@ class BenchmarkScoringTests(unittest.IsolatedAsyncioTestCase):
                 model, "call_model", new_callable=AsyncMock, return_value=(" Paris ", [], "reason", USAGE, "stop")
             ),
         ):
-            record = await gaia.solve(
+            record = await gaia.solve_task(
                 {"id": "1", "task_id": "task", "question": "Capital of France?", "gold": "Paris", "level": 1},
                 ctx,
                 tools=[],
@@ -327,9 +487,9 @@ class BenchmarkScoringTests(unittest.IsolatedAsyncioTestCase):
 
     async def _assert_single_turn(self, module, task, content, extracted):
         ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
-        with patch.object(model, "call_model", new_callable=AsyncMock) as call:
+        with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
             call.return_value = (f" {content} ", [], "reason", USAGE, "stop")
-            record = await module.solve(task, ctx)
+            record = await module.solve_task(task, ctx)
             self.assertEqual((record["score"], record["extracted_prediction"]), (1, extracted))
             self.assertEqual(
                 record["messages"][-1],
@@ -342,21 +502,36 @@ class BenchmarkScoringTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual({key: record[key] for key in USAGE}, USAGE)
             call.side_effect = RuntimeError("request failed")
-            record = await module.solve(task, ctx)
+            record = await module.solve_task(task, ctx)
             self.assertEqual(record["score"], 0)
             self.assertEqual(record["sys_error"], "RuntimeError: request failed")
             self.assertEqual(len(record["messages"]), 2)
 
 
 def _run_main(module, flags):
-    tool_flags = ["--search-provider", "deepseek", "--fetch-provider", "deepseek"] if hasattr(module, "amain") else []
+    tool_flags = (
+        ["--search-provider", "deepseek", "--fetch-provider", "deepseek"]
+        if module in (browsecomp, gaia, webwalkerqa)
+        else []
+    )
     client = MagicMock(close=AsyncMock())
+    record = {
+        "id": "1",
+        "score": 1,
+        "sys_error": None,
+        "topic": "test",
+        "level": 1,
+        "subject": "Algebra",
+        "type": "single_source",
+        "difficulty": "easy",
+    }
     with (
         tempfile.TemporaryDirectory() as temp,
         patch.dict(os.environ, TEST_ENV, clear=True),
         patch.object(module, "load_dotenv"),
         patch("sys.argv", [module.__name__, *flags, *tool_flags]),
-        patch.object(module, "load_data", return_value=[]),
+        patch.object(module, "load_tasks", return_value=[{"id": "1"}]),
+        patch.object(module, "solve_task", new_callable=AsyncMock, return_value=record),
         patch.object(runner, "prepare_run_dir", return_value=Path(temp)),
         patch.object(model, "build_llm_client", return_value=client),
         patch.object(runner, "build_llm_client", return_value=client),

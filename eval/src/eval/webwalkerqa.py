@@ -6,7 +6,6 @@ import json
 import re
 import sys
 import time
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -50,14 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="WebWalkerQA")
     model.add_model_args(parser, max_tokens=32768, concurrency=6, include_judge=True)
     harness.add_tool_args(parser)
-    harness.add_agent_args(parser)
+    harness.add_paradigm_args(parser)
     parser.add_argument("--limit", type=int, default=None, help="run the first N matching tasks")
     parser.add_argument("--type", type=str, choices=("single_source", "multi_source"), help="filter by question type")
     parser.add_argument("--difficulty", type=str, choices=("easy", "medium", "hard"), help="filter by difficulty")
     return parser.parse_args()
 
 
-def load_data(path: Path, limit: int | None, task_type: str | None, difficulty: str | None) -> list[dict[str, Any]]:
+def load_tasks(path: Path, limit: int | None, task_type: str | None, difficulty: str | None) -> list[dict[str, Any]]:
     rows = json.loads(path.read_text(encoding="utf-8"))
     tasks = []
     for index, row in enumerate(rows):
@@ -112,7 +111,7 @@ async def scorer(
     return match.group(1).lower() == "yes", clean_text(verdict, 2000)
 
 
-async def solve(
+async def solve_task(
     task: dict[str, Any], ctx: Context, *, tools: list, judge: AsyncOpenAI, args: argparse.Namespace
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -153,32 +152,10 @@ async def solve(
     )
 
 
-async def amain(
-    args: argparse.Namespace,
-    tasks: list[dict[str, Any]],
-    output_path,
-) -> list[dict[str, Any]]:
-
-    judge = model.build_llm_client(api_key=args.judge_api_key, base_url=args.judge_base_url, timeout=args.timeout)
-    try:
-        async with harness.tool_clients() as (client_search, client_fetch):
-            tools = harness.make_tools(client_search, client_fetch, args)
-            return await runner.run(
-                args,
-                tasks,
-                partial(solve, tools=tools, judge=judge, args=args),
-                output_path,
-                "WebWalkerQA ReAct",
-                max_active_tasks=args.concurrency,
-            )
-    finally:
-        await judge.close()
-
-
 def main() -> int:
     # load data
     args = parse_args()
-    tasks = load_data(DATA_DIR / "WebWalkerQA" / DATA_FILE, args.limit, args.type, args.difficulty)
+    tasks = load_tasks(DATA_DIR / "WebWalkerQA" / DATA_FILE, args.limit, args.type, args.difficulty)
 
     # prepare running folder
     run_dir = runner.prepare_run_dir(
@@ -195,7 +172,17 @@ def main() -> int:
     print(f"Running {len(tasks)} WebWalkerQA tasks with {args.model}; output: {run_dir}")
 
     # run evaluation
-    records = asyncio.run(amain(args, tasks, run_dir / "predictions.json"))
+    records = asyncio.run(
+        runner.run(
+            args,
+            tasks,
+            solve_task,
+            run_dir / "predictions.json",
+            "WebWalkerQA",
+            use_tools=True,
+            use_judge=True,
+        )
+    )
 
     # log summary after evaluation
     summary = runner.build_summary("WebWalkerQA", records, args.model)

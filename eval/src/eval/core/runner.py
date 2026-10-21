@@ -6,13 +6,16 @@ import json
 import os
 import re
 from collections.abc import Callable, Coroutine
+from contextlib import AsyncExitStack
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 from tqdm import tqdm
 
 from eval import OUTPUT_DIR
+from eval.core import harness
 from eval.core.model import Context, build_llm_client, build_model_params
 
 __all__ = ["prepare_run_dir", "run", "make_record", "build_summary"]
@@ -39,50 +42,67 @@ def prepare_run_dir(
 async def run(
     args: argparse.Namespace,
     tasks: list[dict[str, Any]],
-    solve: Callable[[dict[str, Any], Context], Coroutine[Any, Any, dict[str, Any]]],
+    solve_task: Callable[..., Coroutine[Any, Any, dict[str, Any]]],
     output_path: Path,
     desc: str,
     *,
+    use_tools: bool = False,
+    use_judge: bool = False,
     max_active_tasks: int | None = None,
 ) -> list[dict[str, Any]]:
-    "Run tasks with bounded admission and persist predictions incrementally."
+    """Manage shared clients, bind optional tools/judge, and run tasks with bounded admission."""
 
     if args.concurrency < 1:
         raise ValueError("concurrency must be positive")
+
     if max_active_tasks is not None and max_active_tasks < 1:
         raise ValueError("max_active_tasks must be positive")
-    client_llm = build_llm_client(api_key=args.api_key, base_url=args.base_url, timeout=args.timeout)
-    ctx = Context(client_llm=client_llm, params=build_model_params(args), sem=asyncio.Semaphore(args.concurrency))
-    records: list[dict[str, Any]] = []
-    task_iter = iter(tasks)
-    active_limit = min(len(tasks), max_active_tasks if max_active_tasks is not None else args.concurrency)
-    pending: set[asyncio.Task[dict[str, Any]]] = set()
-    for _ in range(active_limit):
-        pending.add(asyncio.create_task(solve(next(task_iter), ctx)))
-    try:
-        with tqdm(total=len(tasks), desc=desc, unit="task") as progress:
-            while pending:
-                completed, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for future in completed:
-                    pending.remove(future)
-                    record = await future
-                    records.append(record)
-                    _write_predictions(output_path, records)
-                    score = f"{sum(r['score'] for r in records)}/{len(records)}"
-                    progress.set_postfix(score=score)
-                    progress.update(1)
-                    try:
-                        task = next(task_iter)
-                    except StopIteration:
-                        continue
-                    pending.add(asyncio.create_task(solve(task, ctx)))
-    finally:
-        for future in pending:
-            if not future.done():
-                future.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        await client_llm.close()
-    return records
+
+    async with AsyncExitStack() as resources:
+        client_llm = build_llm_client(api_key=args.api_key, base_url=args.base_url, timeout=args.timeout)
+        resources.push_async_callback(client_llm.close)
+        solver_kwargs: dict[str, Any] = {}
+        if use_judge:
+            judge = build_llm_client(api_key=args.judge_api_key, base_url=args.judge_base_url, timeout=args.timeout)
+            resources.push_async_callback(judge.close)
+            solver_kwargs["judge"] = judge
+        if use_tools:
+            client_search, client_fetch = await resources.enter_async_context(harness.tool_clients())
+            solver_kwargs["tools"] = harness.make_tools(client_search, client_fetch, args)
+        if solver_kwargs:
+            solve_task = partial(solve_task, args=args, **solver_kwargs)
+        ctx = Context(client_llm=client_llm, params=build_model_params(args), sem=asyncio.Semaphore(args.concurrency))
+        records: list[dict[str, Any]] = []
+        task_iter = iter(tasks)
+        active_limit = min(len(tasks), max_active_tasks if max_active_tasks is not None else args.concurrency)
+        pending: set[asyncio.Task[dict[str, Any]]] = set()
+        for _ in range(active_limit):
+            pending.add(asyncio.create_task(solve_task(next(task_iter), ctx)))
+
+        try:
+            with tqdm(total=len(tasks), desc=desc, unit="task") as progress:
+                while pending:
+                    completed, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for future in completed:
+                        pending.remove(future)
+                        record = await future
+                        records.append(record)
+                        _write_predictions(output_path, records)
+                        score = f"{sum(r['score'] for r in records)}/{len(records)}"
+                        progress.set_postfix(score=score)
+                        progress.update(1)
+                        try:
+                            task = next(task_iter)
+                        except StopIteration:
+                            continue
+                        pending.add(asyncio.create_task(solve_task(task, ctx)))
+        finally:
+            for future in pending:
+                if not future.done():
+                    future.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        return records
 
 
 def make_record(

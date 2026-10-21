@@ -12,17 +12,16 @@ from typing import Any
 from dotenv import load_dotenv
 
 from eval import DATA_DIR, ROOT
-from eval.core import model, runner
+from eval.core import harness, model, runner
 from eval.core.model import Context
 from eval.core.utils import last_json_object
 
-DATA_SUBDIR = "GPQA"
 DATA_FILE = "gpqa_subset_diamond198.json"
 CHOICE_LABELS = ("A", "B", "C", "D")
 CHOICE_RE = re.compile(r"\b([ABCD])\b", re.IGNORECASE)
 ANSWER_CHOICE_RE = re.compile(r"[\"']?answer[\"']?\s*[:=]\s*[\"']?([ABCD])[\"']?", re.IGNORECASE)
 
-SYSTEM_PROMPT = """You are solving a multiple-choice benchmark problem.
+SYSTEM_PROMPT = """You are solving a multiple-choice problem.
 
 Rules:
 1. Solve step by step, DO NOT answer directly with your memory.
@@ -43,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_data(path: Path, limit: int | None) -> list[dict[str, Any]]:
+def load_tasks(path: Path, limit: int | None) -> list[dict[str, Any]]:
     rows = json.loads(path.read_text(encoding="utf-8"))
     tasks = []
     for row in rows:
@@ -71,53 +70,28 @@ def scorer(prediction: str | None, gold: str) -> bool:
     return parsed is not None and parsed == gold
 
 
-async def solve(task: dict[str, Any], ctx: Context) -> dict[str, Any]:
+async def solve_task(task: dict[str, Any], ctx: Context) -> dict[str, Any]:
     choices = "\n".join(f"{label}. {task['choices'][label]}" for label in CHOICE_LABELS)
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"{task['question']}\n\n{choices}"},
-    ]
     started = time.perf_counter()
-    sys_error: str | None = None
-    output: str | None = None
-    usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}
-    finish_reason: str | None = None
+    result = await harness.qa(ctx, f"{task['question']}\n\n{choices}", system_prompt=SYSTEM_PROMPT)
 
-    try:
-        content, _, reasoning, call_usage, finish_reason = await model.call_model(
-            ctx.sem, ctx.client_llm, ctx.params, messages
-        )
-        if call_usage:
-            for key in usage:
-                usage[key] += call_usage[key]
-        output = content.strip()
-        if output:
-            message: dict[str, Any] = {"role": "assistant", "content": output}
-            if reasoning:
-                message["reasoning_content"] = reasoning
-            if call_usage:
-                message["usage"] = call_usage
-            messages.append(message)
-    except Exception as exc:
-        sys_error = f"{type(exc).__name__}: {exc}"
-
-    correct = scorer(output, task["gold"]) if not sys_error else False
+    correct = scorer(result.answer, task["gold"]) if result.sys_error is None else False
     return runner.make_record(
         task,
-        extracted=_parse_answer(output or ""),
+        extracted=_parse_answer(result.answer or ""),
         score=correct,
-        usage=usage,
-        finish_reasons=finish_reason,
+        usage=result.usage,
+        finish_reasons=result.finish_reason,
         latency_sec=time.perf_counter() - started,
-        sys_error=sys_error,
-        messages=messages,
+        sys_error=result.sys_error,
+        messages=result.messages,
     )
 
 
 def main() -> int:
     # load data
     args = parse_args()
-    tasks = load_data(DATA_DIR / DATA_SUBDIR / DATA_FILE, args.limit)
+    tasks = load_tasks(DATA_DIR / "GPQA" / DATA_FILE, args.limit)
 
     # prepare running folder
     run_dir = runner.prepare_run_dir(
@@ -129,7 +103,15 @@ def main() -> int:
     print(f"Running GPQA tasks with {args.model}; output: {run_dir}")
 
     # run evaluation
-    records = asyncio.run(runner.run(args, tasks, solve, run_dir / "predictions.json", "GPQA"))
+    records = asyncio.run(
+        runner.run(
+            args,
+            tasks,
+            solve_task,
+            run_dir / "predictions.json",
+            "GPQA",
+        )
+    )
 
     # log summary after evaluation
     summary = runner.build_summary("GPQA", records, args.model)

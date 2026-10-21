@@ -1,4 +1,4 @@
-"""Agent harness: Tool use and the ReAct loop."""
+"""Agent = Model + Harness. This is harness for constraint."""
 
 import argparse
 import asyncio
@@ -13,16 +13,18 @@ from typing import Any
 import httpx
 
 from eval.core.model import Context, call_model
-from eval.core.utils import clean_text, record_model_call
+from eval.core.utils import append_assistant_message, clean_text, record_model_call, record_token_usage
 
 __all__ = [
     "FETCH_SCHEMA",
     "SEARCH_SCHEMA",
+    "QAResult",
     "ReactResult",
     "Tool",
     "add_tool_args",
-    "add_agent_args",
+    "add_paradigm_args",
     "make_tools",
+    "qa",
     "react",
     "tool_clients",
 ]
@@ -78,6 +80,17 @@ class Tool:
 
 
 @dataclass
+class QAResult:
+    """One QA response and its call metadata; scoring stays with the benchmark."""
+
+    messages: list[dict[str, Any]]
+    answer: str | None
+    usage: dict[str, int]
+    finish_reason: str | None
+    sys_error: str | None
+
+
+@dataclass
 class ReactResult:
     """Everything one ReAct episode produced; scoring and the record stay with the benchmark."""
 
@@ -92,7 +105,7 @@ class ReactResult:
 def add_tool_args(parser: argparse.ArgumentParser) -> None:
     """Select search and fetch backends independently; keep the existing defaults."""
     parser.add_argument("--search-provider", choices=("serper", "deepseek"), default="serper")
-    parser.add_argument("--fetch-provider", choices=("crawl4ai", "deepseek"), default="crawl4ai")
+    parser.add_argument("--fetch-provider", choices=("crawl4ai", "deepseek"), default="deepseek")
     parser.add_argument("--serper-api-key", default=os.getenv("SERPER_API_KEY", ""))
     parser.add_argument("--crawl4ai-url", default=os.getenv("CRAWL4AI_URL", ""))
     parser.add_argument("--crawl4ai-token", default=os.getenv("CRAWL4AI_TOKEN", ""))
@@ -135,19 +148,41 @@ def make_tools(
     return [search, fetch]
 
 
-def add_agent_args(parser: argparse.ArgumentParser) -> None:
+def add_paradigm_args(parser: argparse.ArgumentParser) -> None:
     """Register the shared agent budgets and observation limits."""
     parser.add_argument("--max-steps", type=int, default=16, help="maximum tool-use turns per task")
-    parser.add_argument(
-        "--search-results",
-        type=int,
-        choices=range(1, 51),
-        metavar="N",
-        default=8,
-        help="number of search results per query (1-50)",
-    )
+    parser.add_argument("--search-results", type=int, choices=range(1, 51), metavar="N", default=8, help="1~50")
     parser.add_argument("--observation-chars", type=int, default=12000, help="observation text truncation limit")
     parser.add_argument("--task-timeout", type=int, default=3600, help="per-task time budget in seconds")
+
+
+async def qa(
+    ctx: Context,
+    question: str,
+    *,
+    system_prompt: str,
+) -> QAResult:
+    """Harness with QA paradigm."""
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}
+    answer: str | None = None
+    finish_reason: str | None = None
+    sys_error: str | None = None
+    try:
+        content, _, reasoning, call_usage, finish_reason = await call_model(
+            ctx.sem, ctx.client_llm, ctx.params, messages
+        )
+        record_token_usage(usage, call_usage)
+        answer = content.strip()
+        if answer:
+            append_assistant_message(messages, answer, reasoning, call_usage)
+    except Exception as exc:
+        sys_error = f"{type(exc).__name__}: {exc}"
+    return QAResult(messages, answer, usage, finish_reason, sys_error)
 
 
 async def react(
@@ -159,7 +194,7 @@ async def react(
     max_steps: int,
     task_timeout: int,
 ) -> ReactResult:
-    "Run one ReAct episode to a final answer; tools, prompts and budgets come from the caller."
+    "Harness with ReAct paradigm."
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},

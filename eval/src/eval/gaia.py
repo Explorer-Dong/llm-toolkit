@@ -6,7 +6,6 @@ import json
 import re
 import sys
 import time
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -42,13 +41,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GAIA")
     model.add_model_args(parser)
     harness.add_tool_args(parser)
-    harness.add_agent_args(parser)
+    harness.add_paradigm_args(parser)
     parser.add_argument("--limit", type=int, default=None, help="run the first N matching tasks")
     parser.add_argument("--level", type=int, choices=(1, 2, 3), help="only run tasks of this GAIA level")
     return parser.parse_args()
 
 
-def load_data(path: Path, limit: int | None, level: int | None) -> list[dict[str, Any]]:
+def load_tasks(path: Path, limit: int | None, level: int | None) -> list[dict[str, Any]]:
     raw_tasks = json.loads(path.read_text(encoding="utf-8"))
     tasks = []
     for raw_task in raw_tasks:
@@ -97,7 +96,7 @@ def scorer(prediction: str | None, gold: str) -> bool:
     return normalize_text(prediction) == normalize_text(gold)
 
 
-async def solve(task: dict[str, Any], ctx: Context, *, tools: list, args: argparse.Namespace) -> dict[str, Any]:
+async def solve_task(task: dict[str, Any], ctx: Context, *, tools: list, args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     result = await harness.react(
         ctx,
@@ -150,27 +149,10 @@ async def solve(task: dict[str, Any], ctx: Context, *, tools: list, args: argpar
     )
 
 
-async def amain(
-    args: argparse.Namespace,
-    tasks: list[dict[str, Any]],
-    output_path,
-) -> list[dict[str, Any]]:
-    async with harness.tool_clients() as (client_search, client_fetch):
-        tools = harness.make_tools(client_search, client_fetch, args)
-        return await runner.run(
-            args,
-            tasks,
-            partial(solve, tools=tools, args=args),
-            output_path,
-            "GAIA ReAct",
-            max_active_tasks=args.concurrency,
-        )
-
-
 def main() -> int:
     # load data
     args = parse_args()
-    tasks = load_data(DATA_DIR / "GAIA" / DATA_FILE, args.limit, args.level)
+    tasks = load_tasks(DATA_DIR / "GAIA" / DATA_FILE, args.limit, args.level)
 
     # prepare running folder
     secrets = {"api_key", "serper_api_key", "crawl4ai_token", "ds_tool_key"}
@@ -188,7 +170,16 @@ def main() -> int:
     print(f"Running GAIA tasks with {args.model}; output: {run_dir}")
 
     # run evaluation
-    records = asyncio.run(amain(args, tasks, run_dir / "predictions.json"))
+    records = asyncio.run(
+        runner.run(
+            args,
+            tasks,
+            solve_task,
+            run_dir / "predictions.json",
+            "GAIA",
+            use_tools=True,
+        )
+    )
 
     # log summary after evaluation
     summary = runner.build_summary("GAIA", records, args.model)

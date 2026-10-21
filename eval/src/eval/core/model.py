@@ -1,4 +1,4 @@
-"""Model call primitives: request assembly, streaming parse, and per-call capture."""
+"""Agent = Model + Harness. This is model for interaction."""
 
 import argparse
 import asyncio

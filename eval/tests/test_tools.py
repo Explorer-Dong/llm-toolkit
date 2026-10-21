@@ -37,7 +37,7 @@ class ToolCliTests(unittest.TestCase):
                 self.assertEqual((args.search_provider, args.fetch_provider), (search, fetch))
         for module in BENCHMARKS:
             args = _parse_args(module)
-            self.assertEqual((args.search_provider, args.fetch_provider), ("serper", "crawl4ai"))
+            self.assertEqual((args.search_provider, args.fetch_provider), ("serper", "deepseek"))
 
     def test_credentials_load_from_env_and_cli_can_override(self):
         flags = ["--search-provider", "deepseek", "--fetch-provider", "deepseek"]
@@ -71,7 +71,7 @@ class ToolCliTests(unittest.TestCase):
             # Stop at artifact creation, before any model, judge, or tool request.
             with (
                 patch.object(module, "parse_args", return_value=args),
-                patch.object(module, "load_data", return_value=[]),
+                patch.object(module, "load_tasks", return_value=[]),
                 patch.object(runner, "prepare_run_dir", side_effect=RuntimeError("stop")) as prepare,
                 self.assertRaisesRegex(RuntimeError, "stop"),
             ):
