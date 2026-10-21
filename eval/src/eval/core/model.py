@@ -13,7 +13,7 @@ from openai import AsyncOpenAI
 __all__ = ["Context", "ModelParams", "add_model_args", "build_llm_client", "build_model_params", "call_model"]
 
 _LLM_MAX_RETRIES = 3
-_LOG_ONLY_KEYS = ("reasoning_content", "usage")
+_LOG_ONLY_KEYS = ("reasoning_content", "usage", "finish_reason")
 
 
 @dataclass(frozen=True)
@@ -101,7 +101,7 @@ async def call_model(
 ) -> tuple[str, list[dict[str, Any]], str, dict[str, int] | None, str | None]:
     "Stream one chat completion; return (content, tool_calls, reasoning, usage, finish_reason)."
 
-    # reasoning_content and usage are log-only extensions; keep them out of the wire request
+    # Keep log-only message fields out of the wire request.
     extra_body = dict(params.extra_body) if params.extra_body else {}
     if params.enable_thinking is not None:
         extra_body["chat_template_kwargs"] = {"enable_thinking": params.enable_thinking}

@@ -13,13 +13,12 @@ from typing import Any
 import httpx
 
 from eval.core.model import Context, call_model
-from eval.core.utils import append_assistant_message, clean_text, record_model_call, record_token_usage
+from eval.core.utils import clean_text
 
 __all__ = [
     "FETCH_SCHEMA",
     "SEARCH_SCHEMA",
-    "QAResult",
-    "ReactResult",
+    "AgentResult",
     "Tool",
     "add_tool_args",
     "add_paradigm_args",
@@ -80,19 +79,8 @@ class Tool:
 
 
 @dataclass
-class QAResult:
-    """One QA response and its call metadata; scoring stays with the benchmark."""
-
-    messages: list[dict[str, Any]]
-    answer: str | None
-    usage: dict[str, int]
-    finish_reason: str | None
-    sys_error: str | None
-
-
-@dataclass
-class ReactResult:
-    """Everything one ReAct episode produced; scoring and the record stay with the benchmark."""
+class AgentResult:
+    """One agent episode and its call metadata; scoring stays with the benchmark."""
 
     messages: list[dict[str, Any]]
     answer: str | None
@@ -161,7 +149,7 @@ async def qa(
     question: str,
     *,
     system_prompt: str,
-) -> QAResult:
+) -> AgentResult:
     """Harness with QA paradigm."""
 
     messages: list[dict[str, Any]] = [
@@ -170,19 +158,33 @@ async def qa(
     ]
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}
     answer: str | None = None
-    finish_reason: str | None = None
+    finish_reasons: dict[str, int] = {}
+    steps = 0
     sys_error: str | None = None
     try:
-        content, _, reasoning, call_usage, finish_reason = await call_model(
+        content, _, reasoning_content, call_usage, finish_reason = await call_model(
             ctx.sem, ctx.client_llm, ctx.params, messages
         )
-        record_token_usage(usage, call_usage)
+        steps += 1
+        if call_usage:
+            for key in usage:
+                usage[key] += call_usage[key]
+        finish_reason = finish_reason or "unknown"
+        finish_reasons[finish_reason] = finish_reasons.get(finish_reason, 0) + 1
         answer = content.strip()
-        if answer:
-            append_assistant_message(messages, answer, reasoning, call_usage)
+        messages.append(
+            {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": reasoning_content,
+                "usage": call_usage,
+                "finish_reason": finish_reason,
+            }
+        )
     except Exception as exc:
         sys_error = f"{type(exc).__name__}: {exc}"
-    return QAResult(messages, answer, usage, finish_reason, sys_error)
+
+    return AgentResult(messages, answer, usage, finish_reasons, steps, sys_error)
 
 
 async def react(
@@ -193,7 +195,7 @@ async def react(
     system_prompt: str,
     max_steps: int,
     task_timeout: int,
-) -> ReactResult:
+) -> AgentResult:
     "Harness with ReAct paradigm."
 
     messages: list[dict[str, Any]] = [
@@ -211,16 +213,27 @@ async def react(
     try:
         async with timeout_scope:
             for _step in range(1, max_steps + 1):
-                content, calls, reasoning, call_usage, finish_reason = await call_model(
+                content, calls, reasoning_content, call_usage, finish_reason = await call_model(
                     ctx.sem, ctx.client_llm, ctx.params, messages, tools=schemas or None
                 )
                 steps += 1
-                record_model_call(usage, finish_reasons, call_usage, finish_reason)
+                if call_usage:
+                    for key in usage:
+                        usage[key] += call_usage[key]
+                finish_reason = finish_reason or "unknown"
+                finish_reasons[finish_reason] = finish_reasons.get(finish_reason, 0) + 1
+
+                message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content or None,
+                    "finish_reason": finish_reason,
+                }
+                if reasoning_content:
+                    message["reasoning_content"] = reasoning_content
+                if call_usage:
+                    message["usage"] = call_usage
 
                 if calls:
-                    message: dict[str, Any] = {"role": "assistant", "content": content or None}
-                    if reasoning:
-                        message["reasoning_content"] = reasoning
                     message["tool_calls"] = [
                         {
                             "id": call["id"],
@@ -232,9 +245,9 @@ async def react(
                         }
                         for call in calls
                     ]
-                    if call_usage:
-                        message["usage"] = call_usage
-                    messages.append(message)
+                messages.append(message)
+
+                if calls:
                     for call in calls:
                         tool = next((t for t in tools if t.schema["function"]["name"] == call["name"]), None)
                         if tool is None:
@@ -246,12 +259,6 @@ async def react(
 
                 if content:
                     answer = content
-                    message = {"role": "assistant", "content": content}
-                    if reasoning:
-                        message["reasoning_content"] = reasoning
-                    if call_usage:
-                        message["usage"] = call_usage
-                    messages.append(message)
                     break
 
                 messages.append(
@@ -259,7 +266,7 @@ async def react(
                         "role": "user",
                         "content": (
                             "Your reply was empty. Call one of the tools if you need more information, "
-                            "or reply with only the final answer now."
+                            "or reply with the final answer in the format required by the system prompt."
                         ),
                     }
                 )
@@ -269,23 +276,27 @@ async def react(
                     {
                         "role": "user",
                         "content": (
-                            "No steps remain. Do not call any more tools. Reply now with only the final answer value "
-                            "itself — no reasoning, explanation, or any other text."
+                            "No steps remain. Do not call any more tools. Reply now with only the final answer "
+                            "in the format required by the system prompt."
                         ),
                     }
                 )
-                content, _, reasoning, call_usage, finish_reason = await call_model(
+                content, _, reasoning_content, call_usage, finish_reason = await call_model(
                     ctx.sem, ctx.client_llm, ctx.params, messages
                 )
-                record_model_call(usage, finish_reasons, call_usage, finish_reason)
+                steps += 1
+                if call_usage:
+                    for key in usage:
+                        usage[key] += call_usage[key]
+                finish_reason = finish_reason or "unknown"
+                finish_reasons[finish_reason] = finish_reasons.get(finish_reason, 0) + 1
                 answer = content.strip() or None
-                if content:
-                    message = {"role": "assistant", "content": content}
-                    if reasoning:
-                        message["reasoning_content"] = reasoning
-                    if call_usage:
-                        message["usage"] = call_usage
-                    messages.append(message)
+                message = {"role": "assistant", "content": content, "finish_reason": finish_reason}
+                if reasoning_content:
+                    message["reasoning_content"] = reasoning_content
+                if call_usage:
+                    message["usage"] = call_usage
+                messages.append(message)
                 if answer is None:
                     sys_error = f"max_steps_exceeded ({max_steps})"
 
@@ -295,7 +306,7 @@ async def react(
     except Exception as exc:
         sys_error = f"{type(exc).__name__}: {exc}"
 
-    return ReactResult(messages, answer, usage, finish_reasons, steps, sys_error)
+    return AgentResult(messages, answer, usage, finish_reasons, steps, sys_error)
 
 
 def _make_serper_search(client: httpx.AsyncClient, api_key: str, limit: int, clean_limit: int) -> Tool:

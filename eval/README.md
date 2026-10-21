@@ -58,3 +58,7 @@ per benchmark module include:
 - `scorer`: score the prediction against the ground truth
 - `solve_task`: solver of one sample
 - `main`: running control
+
+GAIA requests a JSON final answer such as `{"answer": "..."}` and parses it locally without another model request. Records store the parsed value in `extracted_prediction`, retain raw responses in `messages`, and use floating-point scores.
+
+Both `qa` and `react` return `AgentResult`, with aggregate `usage`, `finish_reasons`, and a `steps` count of completed model responses. Every assistant message records its own `finish_reason` (`"unknown"` when unavailable); this log-only field is excluded from subsequent model requests.

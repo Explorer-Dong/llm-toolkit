@@ -144,7 +144,15 @@ class ModelCallTests(unittest.IsolatedAsyncioTestCase):
             ),
         ]
         client, stream = _make_client(chunks)
-        messages = [{"role": "assistant", "content": "previous", "reasoning_content": "hidden", "usage": USAGE}]
+        messages = [
+            {
+                "role": "assistant",
+                "content": "previous",
+                "reasoning_content": "hidden",
+                "usage": USAGE,
+                "finish_reason": "stop",
+            }
+        ]
         params = replace(PARAMS, enable_thinking=False, extra_body={"top_k": 7})
         content, calls, reasoning, usage, finish_reason = await model.call_model(
             asyncio.Semaphore(1), client, params, messages
@@ -162,6 +170,7 @@ class ModelCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["extra_body"], {"top_k": 7, "chat_template_kwargs": {"enable_thinking": False}})
         self.assertEqual(request["stream_options"], {"include_usage": True})
         self.assertEqual(messages[0]["reasoning_content"], "hidden")
+        self.assertEqual(messages[0]["finish_reason"], "stop")
         stream.close.assert_awaited_once()
 
     async def test_zero_top_k_omits_extra_body_and_keeps_tool_schema(self):
@@ -188,29 +197,38 @@ class QATests(unittest.IsolatedAsyncioTestCase):
             call.return_value = ("  answer\n", [], "reason", USAGE, "stop")
             result = await harness.qa(ctx, "question", system_prompt="system")
 
-        self.assertIsInstance(result, harness.QAResult)
-        self.assertEqual((result.answer, result.finish_reason, result.sys_error), ("answer", "stop", None))
+        self.assertIsInstance(result, harness.AgentResult)
+        self.assertEqual(result.steps, 1)
+        self.assertEqual((result.answer, result.finish_reasons, result.sys_error), ("answer", {"stop": 1}, None))
         self.assertEqual(result.usage, USAGE)
         self.assertEqual(
             result.messages,
             [
                 {"role": "system", "content": "system"},
                 {"role": "user", "content": "question"},
-                {"role": "assistant", "content": "answer", "reasoning_content": "reason", "usage": USAGE},
+                {
+                    "role": "assistant",
+                    "content": "  answer\n",
+                    "reasoning_content": "reason",
+                    "usage": USAGE,
+                    "finish_reason": "stop",
+                },
             ],
         )
         call.assert_awaited_once_with(ctx.sem, ctx.client_llm, ctx.params, result.messages)
 
-    async def test_empty_answer_keeps_usage_without_adding_an_assistant_message(self):
+    async def test_empty_answer_keeps_usage_and_assistant_finish_reason(self):
         ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
         with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
             call.return_value = (" \n", [], "reason", USAGE, "length")
             result = await harness.qa(ctx, "question", system_prompt="system")
         self.assertEqual(result.answer, "")
         self.assertEqual(result.usage, USAGE)
-        self.assertEqual(result.finish_reason, "length")
+        self.assertEqual(result.finish_reasons, {"length": 1})
+        self.assertEqual(result.steps, 1)
         self.assertIsNone(result.sys_error)
-        self.assertEqual(len(result.messages), 2)
+        self.assertEqual(len(result.messages), 3)
+        self.assertEqual(result.messages[-1]["finish_reason"], "length")
         call.assert_awaited_once()
 
     async def test_missing_usage_and_reasoning_remain_optional(self):
@@ -218,8 +236,17 @@ class QATests(unittest.IsolatedAsyncioTestCase):
         with patch.object(harness, "call_model", new_callable=AsyncMock, return_value=("answer", [], "", None, None)):
             result = await harness.qa(ctx, "question", system_prompt="system")
         self.assertEqual(result.usage, dict.fromkeys(USAGE, 0))
-        self.assertIsNone(result.finish_reason)
-        self.assertEqual(result.messages[-1], {"role": "assistant", "content": "answer"})
+        self.assertEqual(result.finish_reasons, {"unknown": 1})
+        self.assertEqual(
+            result.messages[-1],
+            {
+                "role": "assistant",
+                "content": "answer",
+                "reasoning_content": "",
+                "usage": None,
+                "finish_reason": "unknown",
+            },
+        )
 
     async def test_request_error_is_recorded_without_a_fallback_request(self):
         ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
@@ -228,7 +255,8 @@ class QATests(unittest.IsolatedAsyncioTestCase):
         ) as call:
             result = await harness.qa(ctx, "question", system_prompt="system")
         self.assertIsNone(result.answer)
-        self.assertIsNone(result.finish_reason)
+        self.assertEqual(result.finish_reasons, {})
+        self.assertEqual(result.steps, 0)
         self.assertEqual(result.sys_error, "RuntimeError: request failed")
         self.assertEqual(result.usage, dict.fromkeys(USAGE, 0))
         self.assertEqual(len(result.messages), 2)
@@ -241,6 +269,144 @@ class QATests(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(asyncio.CancelledError),
         ):
             await harness.qa(ctx, "question", system_prompt="system")
+
+
+class RecordTests(unittest.TestCase):
+    def test_keeps_fractional_score_and_extracted_prediction(self):
+        record = runner.make_record(
+            {"id": "1", "gold": "answer"},
+            extracted_prediction="prediction",
+            score=0.375,
+            usage=USAGE,
+            finish_reasons={"stop": 1},
+            latency_sec=1.23456,
+            sys_error=None,
+            messages=[],
+        )
+        self.assertEqual(record["extracted_prediction"], "prediction")
+        self.assertEqual(record["score"], 0.375)
+        self.assertIsInstance(record["score"], float)
+        self.assertEqual(json.loads(json.dumps(record))["score"], 0.375)
+
+
+class GAIAAnswerTests(unittest.IsolatedAsyncioTestCase):
+    def test_parses_string_answer_and_keeps_leading_zeros(self):
+        self.assertEqual(gaia._parse_answer('{"answer": " 00321 "}'), "00321")
+        self.assertEqual(gaia._parse_answer('{"answer": "Paris; 42"}'), "Paris; 42")
+
+    def test_parses_fenced_json_and_numeric_answers(self):
+        self.assertEqual(gaia._parse_answer('```json\n{"answer": "Paris"}\n```'), "Paris")
+        self.assertEqual(gaia._parse_answer('{"answer": 42}'), "42")
+        self.assertEqual(gaia._parse_answer('{"answer": 1.25}'), "1.25")
+
+    def test_rejects_missing_or_invalid_answer_fields(self):
+        for content in (
+            "Paris",
+            "",
+            '{"answer":',
+            '{"other": "Paris"}',
+            '{"answer": true}',
+            '{"answer": null}',
+            '{"answer": ["Paris"]}',
+            '{"answer": {"city": "Paris"}}',
+        ):
+            with self.subTest(content=content):
+                self.assertIsNone(gaia._parse_answer(content))
+
+    async def test_wrong_or_malformed_answers_do_not_trigger_model_extraction(self):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        for content, prediction in (('{"answer": "London"}', "London"), ("The answer is Paris", None)):
+            with self.subTest(content=content):
+                result = harness.AgentResult([], content, dict(USAGE), {"stop": 1}, 1, None)
+                with (
+                    patch.object(harness, "react", new_callable=AsyncMock, return_value=result),
+                    patch.object(harness, "call_model", new_callable=AsyncMock) as call,
+                    patch.object(model, "call_model", new_callable=AsyncMock) as direct_call,
+                ):
+                    record = await gaia.solve_task(
+                        {"id": "1", "task_id": "task", "question": "Capital?", "gold": "Paris", "level": 1},
+                        ctx,
+                        tools=[],
+                        args=argparse.Namespace(max_steps=16, task_timeout=3600),
+                    )
+                self.assertEqual(record["extracted_prediction"], prediction)
+                self.assertEqual(record["score"], 0.0)
+                self.assertIsNone(record["sys_error"])
+                self.assertEqual(result.messages, [])
+                call.assert_not_awaited()
+                direct_call.assert_not_awaited()
+
+
+class ReactFormatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_records_tool_empty_and_final_turns_and_sums_usage(self):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        tool_run = AsyncMock(return_value="observation")
+        tool = harness.Tool(harness.SEARCH_SCHEMA, "query", tool_run)
+        calls = [{"id": "search_1", "name": "search", "arguments": {"query": "capital"}}]
+        with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
+            call.side_effect = [
+                ("", calls, "search reasoning", USAGE, "tool_calls"),
+                ("", [], "empty reasoning", USAGE, "length"),
+                ('{"answer": "Paris"}', [], "", USAGE, "stop"),
+            ]
+            result = await harness.react(
+                ctx, "Capital?", tools=[tool], system_prompt=gaia.SYSTEM_PROMPT, max_steps=2, task_timeout=1
+            )
+        self.assertIsInstance(result, harness.AgentResult)
+        self.assertIsNone(result.sys_error)
+        self.assertEqual(result.steps, 3)
+        self.assertEqual(result.usage, {key: value * 3 for key, value in USAGE.items()})
+        self.assertEqual(result.finish_reasons, {"tool_calls": 1, "length": 1, "stop": 1})
+        assistants = [message for message in result.messages if message["role"] == "assistant"]
+        self.assertEqual([message["finish_reason"] for message in assistants], ["tool_calls", "length", "stop"])
+        self.assertEqual(assistants[1]["reasoning_content"], "empty reasoning")
+        self.assertEqual(assistants[0]["tool_calls"][0]["function"]["arguments"], '{"query": "capital"}')
+        tool_run.assert_awaited_once_with("capital")
+        self.assertIsNone(call.call_args.kwargs.get("tools"))
+
+    async def test_missing_metadata_uses_unknown_finish_reason_without_losing_turn(self):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        with patch.object(harness, "call_model", new_callable=AsyncMock, return_value=("answer", [], "", None, None)):
+            result = await harness.react(
+                ctx, "Question?", tools=[], system_prompt="system", max_steps=1, task_timeout=1
+            )
+        self.assertEqual(result.steps, 1)
+        self.assertEqual(result.finish_reasons, {"unknown": 1})
+        self.assertEqual(result.messages[-1]["finish_reason"], "unknown")
+        self.assertEqual(result.usage, dict.fromkeys(USAGE, 0))
+
+    async def test_final_request_preserves_the_system_output_format(self):
+        ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
+        with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
+            call.return_value = ('{"answer": "Paris"}', [], "", USAGE, "stop")
+            result = await harness.react(
+                ctx,
+                "Capital?",
+                tools=[],
+                system_prompt=gaia.SYSTEM_PROMPT,
+                max_steps=0,
+                task_timeout=1,
+            )
+        self.assertEqual(result.answer, '{"answer": "Paris"}')
+        self.assertEqual(result.steps, 1)
+        self.assertEqual(result.messages[-1]["finish_reason"], "stop")
+        self.assertIsNone(result.sys_error)
+        self.assertIn("format required by the system prompt", result.messages[-2]["content"])
+        call.assert_awaited_once()
+
+
+class JudgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_browsecomp_failed_stream_is_closed_and_error_propagates(self):
+        client, stream = _make_client([], error=RuntimeError("judge stream failed"))
+        with self.assertRaisesRegex(RuntimeError, "judge stream failed"):
+            await browsecomp.scorer(asyncio.Semaphore(1), client, "judge", "question", "prediction", "gold")
+        stream.close.assert_awaited_once()
+
+    async def test_webwalkerqa_failed_stream_is_closed_and_error_propagates(self):
+        client, stream = _make_client([], error=RuntimeError("judge stream failed"))
+        with self.assertRaisesRegex(RuntimeError, "judge stream failed"):
+            await webwalkerqa.scorer(asyncio.Semaphore(1), client, "judge", "question", "prediction", "gold")
+        stream.close.assert_awaited_once()
 
 
 class RunnerTests(unittest.IsolatedAsyncioTestCase):
@@ -458,21 +624,15 @@ class BenchmarkScoringTests(unittest.IsolatedAsyncioTestCase):
             await webwalkerqa.scorer(asyncio.Semaphore(1), client, "test-judge", "q", "p", "g")
         stream.close.assert_awaited_once()
 
-    async def test_gaia_extraction_preserves_raw_content_and_usage_counts(self):
-        result = SimpleNamespace(
-            answer="The answer is Paris",
-            sys_error=None,
-            messages=[],
-            usage=dict.fromkeys(USAGE, 0),
-            finish_reasons={},
-            steps=1,
-        )
+    async def test_gaia_json_answer_preserves_raw_content_and_usage_counts(self):
+        content = ' {"answer": "Paris"} '
+        messages = [{"role": "assistant", "content": content, "usage": USAGE}]
+        result = harness.AgentResult(messages, content, dict(USAGE), {"stop": 1}, 1, None)
         ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
         with (
-            patch.object(gaia.harness, "react", new_callable=AsyncMock, return_value=result),
-            patch.object(
-                model, "call_model", new_callable=AsyncMock, return_value=(" Paris ", [], "reason", USAGE, "stop")
-            ),
+            patch.object(harness, "react", new_callable=AsyncMock, return_value=result),
+            patch.object(harness, "call_model", new_callable=AsyncMock) as call,
+            patch.object(model, "call_model", new_callable=AsyncMock) as direct_call,
         ):
             record = await gaia.solve_task(
                 {"id": "1", "task_id": "task", "question": "Capital of France?", "gold": "Paris", "level": 1},
@@ -480,24 +640,32 @@ class BenchmarkScoringTests(unittest.IsolatedAsyncioTestCase):
                 tools=[],
                 args=argparse.Namespace(max_steps=16, task_timeout=3600),
             )
-        self.assertEqual((record["score"], record["extracted_prediction"]), (1, "Paris"))
-        self.assertEqual(record["messages"][-1]["content"], " Paris ")
+        self.assertEqual((record["score"], record["extracted_prediction"]), (1.0, "Paris"))
+        self.assertIsInstance(record["score"], float)
+        self.assertEqual(record["messages"], messages)
+        self.assertEqual(record["messages"][-1]["content"], content)
         self.assertEqual(record["finish_reasons"], {"stop": 1})
         self.assertEqual({key: record[key] for key in USAGE}, USAGE)
+        call.assert_not_awaited()
+        direct_call.assert_not_awaited()
 
     async def _assert_single_turn(self, module, task, content, extracted):
         ctx = model.Context(client_llm=MagicMock(), params=PARAMS, sem=asyncio.Semaphore(1))
         with patch.object(harness, "call_model", new_callable=AsyncMock) as call:
             call.return_value = (f" {content} ", [], "reason", USAGE, "stop")
             record = await module.solve_task(task, ctx)
-            self.assertEqual((record["score"], record["extracted_prediction"]), (1, extracted))
+            self.assertEqual((record["score"], record["extracted_prediction"]), (1.0, extracted))
+            self.assertIsInstance(record["score"], float)
+            self.assertEqual(record["finish_reasons"], {"stop": 1})
+            self.assertEqual(record["steps"], 1)
             self.assertEqual(
                 record["messages"][-1],
                 {
                     "role": "assistant",
-                    "content": content,
+                    "content": f" {content} ",
                     "reasoning_content": "reason",
                     "usage": USAGE,
+                    "finish_reason": "stop",
                 },
             )
             self.assertEqual({key: record[key] for key in USAGE}, USAGE)

@@ -138,8 +138,8 @@ async def solve_task(
 
     return runner.make_record(
         task,
-        extracted=result.answer,
-        score=correct,
+        extracted_prediction=result.answer,
+        score=float(correct),
         usage=result.usage,
         finish_reasons=result.finish_reasons,
         latency_sec=time.perf_counter() - started,

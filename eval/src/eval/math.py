@@ -102,13 +102,14 @@ async def solve_task(task: dict[str, Any], ctx: Context) -> dict[str, Any]:
     correct = scorer(result.answer, task["gold"]) if result.answer and result.sys_error is None else False
     return runner.make_record(
         task,
-        extracted=extracted,
-        score=correct,
+        extracted_prediction=extracted,
+        score=float(correct),
         usage=result.usage,
-        finish_reasons=result.finish_reason,
+        finish_reasons=result.finish_reasons,
         latency_sec=time.perf_counter() - started,
         sys_error=result.sys_error,
         messages=result.messages,
+        steps=result.steps,
         subject=task["subject"],
         level=task["level"],
     )
