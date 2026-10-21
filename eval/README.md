@@ -4,6 +4,8 @@ Unified evaluation harness for the LLM benchmarks.
 
 ## Run
 
+From `eval/`:
+
 Setup env:
 
 ```bash
@@ -35,6 +37,7 @@ Results will be stored in `outputs/<benchmark>/<timestamp>_<model>/`.
 
 ```
 eval/
+├── data/<bench>/       # dataset of each bench
 ├── src/eval/
 │   ├── core/
 │   │   ├── model.py    # streaming model call, ModelParams/Context, per-call capture
@@ -44,8 +47,7 @@ eval/
 │   ├── aime.py
 │   ├── browsecomp.py
 │   └── <bench>.py      # other bench
-├── data/<bench>/       # dataset of each bench
-├── outputs/<benchmark>/<timestamp>_<model>/
+├── tests/              # unit tests
 └── docker-compose.yml  # start tool server locally
 ```
 
