@@ -1,9 +1,8 @@
-"""BrowseComp: search/fetch ReAct scored by an LLM judge."""
+"""BrowseComp: multi-turn web search benchmark."""
 
 import argparse
 import asyncio
 import json
-import os
 import re
 import sys
 import time
@@ -48,21 +47,13 @@ correct: Answer 'yes' if extracted_final_answer matches the [correct_answer] giv
 
 def parse_args() -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
-    parser = argparse.ArgumentParser(description="Async tool-calling harness for BrowseComp")
-    runner.add_common_args(parser, max_tokens=32768)
-    parser.add_argument("--topic", type=str, default=None, help="only run tasks of this problem topic")
+    parser = argparse.ArgumentParser(description="BrowseComp")
+    model.add_model_args(parser, max_tokens=32768, concurrency=6, include_judge=True)
     harness.add_tool_args(parser)
-    parser.add_argument("--judge-model", default=os.getenv("JUDGE_MODEL", "gpt-4o"), help="judge model for scoring")
-    parser.add_argument("--judge-base-url", default=os.getenv("JUDGE_BASE_URL"), help="base URL for the judge endpoint")
-    parser.add_argument("--judge-api-key", default=os.getenv("JUDGE_API_KEY"), help="API key for the judge endpoint")
-    parser.add_argument("--max-steps", type=int, default=16, help="maximum tool-use turns per task")
-    parser.add_argument("--search-results", type=int, default=8, help="number of search results per query")
-    parser.add_argument("--observation-chars", type=int, default=12000, help="observation text truncation limit")
-    parser.add_argument("--task-timeout", type=int, default=3600, help="per-task time budget in seconds")
-    parser.set_defaults(concurrency=6)
-    args = parser.parse_args()
-    harness.validate_tool_args(parser, args)
-    return args
+    harness.add_agent_args(parser)
+    parser.add_argument("--limit", type=int, default=None, help="run the first N matching tasks")
+    parser.add_argument("--topic", type=str, default=None, help="only run tasks of this problem topic")
+    return parser.parse_args()
 
 
 def load_data(path: Path, limit: int | None, topic: str | None) -> list[dict[str, Any]]:
@@ -159,7 +150,6 @@ async def solve(
 async def amain(
     args: argparse.Namespace,
     tasks: list[dict[str, Any]],
-    params: model.ModelParams,
     output_path,
 ) -> list[dict[str, Any]]:
 
@@ -173,7 +163,6 @@ async def amain(
                 partial(solve, tools=tools, judge=judge, args=args),
                 output_path,
                 "BrowseComp ReAct",
-                params,
                 max_active_tasks=args.concurrency,
             )
     finally:
@@ -200,15 +189,7 @@ def main() -> int:
     print(f"Running {len(tasks)} BrowseComp tasks with {args.model}; output: {run_dir}")
 
     # run evaluation
-    params = model.ModelParams(
-        model=args.model,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_tokens=args.max_tokens,
-        seed=args.seed,
-        enable_thinking=args.enable_thinking,
-    )
-    records = asyncio.run(amain(args, tasks, params, run_dir / "predictions.json"))
+    records = asyncio.run(amain(args, tasks, run_dir / "predictions.json"))
 
     # log summary after evaluation
     summary = runner.build_summary("BrowseComp", records, args.model)

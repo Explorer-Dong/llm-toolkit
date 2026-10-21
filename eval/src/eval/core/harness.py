@@ -15,18 +15,16 @@ import httpx
 from eval.core.model import Context, call_model
 from eval.core.utils import clean_text, record_model_call
 
-# Globals
-
 __all__ = [
     "FETCH_SCHEMA",
     "SEARCH_SCHEMA",
     "ReactResult",
     "Tool",
     "add_tool_args",
+    "add_agent_args",
     "make_tools",
     "react",
     "tool_clients",
-    "validate_tool_args",
 ]
 
 _TOOL_TIMEOUT_SEC = 60
@@ -68,8 +66,6 @@ FETCH_SCHEMA = {
     },
 }
 
-# Classes
-
 
 @dataclass(frozen=True)
 class Tool:
@@ -93,7 +89,15 @@ class ReactResult:
     sys_error: str | None
 
 
-# Public functions
+def add_tool_args(parser: argparse.ArgumentParser) -> None:
+    """Select search and fetch backends independently; keep the existing defaults."""
+    parser.add_argument("--search-provider", choices=("serper", "deepseek"), default="serper")
+    parser.add_argument("--fetch-provider", choices=("crawl4ai", "deepseek"), default="crawl4ai")
+    parser.add_argument("--serper-api-key", default=os.getenv("SERPER_API_KEY", ""))
+    parser.add_argument("--crawl4ai-url", default=os.getenv("CRAWL4AI_URL", ""))
+    parser.add_argument("--crawl4ai-token", default=os.getenv("CRAWL4AI_TOKEN", ""))
+    parser.add_argument("--ds-tool-url", default=os.getenv("DS_TOOL_URL", ""), help="DeepSeek tools base URL")
+    parser.add_argument("--ds-tool-key", default=os.getenv("DS_TOOL_KEY", ""), help="DeepSeek tools API key")
 
 
 @asynccontextmanager
@@ -110,39 +114,6 @@ async def tool_clients() -> AsyncIterator[tuple[httpx.AsyncClient, httpx.AsyncCl
         httpx.AsyncClient(trust_env=False, follow_redirects=True) as client_fetch,
     ):
         yield client_search, client_fetch
-
-
-def add_tool_args(parser: argparse.ArgumentParser) -> None:
-    """Select search and fetch backends independently; keep the existing defaults."""
-    parser.add_argument("--search-provider", choices=("serper", "deepseek"), default="serper")
-    parser.add_argument("--fetch-provider", choices=("crawl4ai", "deepseek"), default="crawl4ai")
-    parser.add_argument("--serper-api-key", default=os.getenv("SERPER_API_KEY"))
-    parser.add_argument("--crawl4ai-url", default=os.getenv("CRAWL4AI_URL"))
-    parser.add_argument("--crawl4ai-token", default=os.getenv("CRAWL4AI_TOKEN"))
-    parser.add_argument(
-        "--ds-tool-url",
-        default=os.getenv("DS_TOOL_URL"),
-        help="DeepSeek tools base URL ending in /v1/tools",
-    )
-    parser.add_argument("--ds-tool-key", default=os.getenv("DS_TOOL_KEY"), help="DeepSeek tools API key")
-
-
-def validate_tool_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """Require credentials only for the backends selected for this run."""
-    required = {}
-    if args.search_provider == "serper":
-        required["SERPER_API_KEY / --serper-api-key"] = args.serper_api_key
-    if args.fetch_provider == "crawl4ai":
-        required["CRAWL4AI_URL / --crawl4ai-url"] = args.crawl4ai_url
-        required["CRAWL4AI_TOKEN / --crawl4ai-token"] = args.crawl4ai_token
-    if "deepseek" in (args.search_provider, args.fetch_provider):
-        required["DS_TOOL_URL / --ds-tool-url"] = args.ds_tool_url
-        required["DS_TOOL_KEY / --ds-tool-key"] = args.ds_tool_key
-    for name, value in required.items():
-        if not value or not value.strip():
-            parser.error(f"the selected tool providers require {name}")
-    if args.search_provider == "deepseek" and not 1 <= args.search_results <= 50:
-        parser.error("DeepSeek --search-results must be between 1 and 50")
 
 
 def make_tools(
@@ -162,6 +133,21 @@ def make_tools(
         else _make_crawl4ai_fetch(client_fetch, args.crawl4ai_url, args.crawl4ai_token, args.observation_chars)
     )
     return [search, fetch]
+
+
+def add_agent_args(parser: argparse.ArgumentParser) -> None:
+    """Register the shared agent budgets and observation limits."""
+    parser.add_argument("--max-steps", type=int, default=16, help="maximum tool-use turns per task")
+    parser.add_argument(
+        "--search-results",
+        type=int,
+        choices=range(1, 51),
+        metavar="N",
+        default=8,
+        help="number of search results per query (1-50)",
+    )
+    parser.add_argument("--observation-chars", type=int, default=12000, help="observation text truncation limit")
+    parser.add_argument("--task-timeout", type=int, default=3600, help="per-task time budget in seconds")
 
 
 async def react(
@@ -275,9 +261,6 @@ async def react(
         sys_error = f"{type(exc).__name__}: {exc}"
 
     return ReactResult(messages, answer, usage, finish_reasons, steps, sys_error)
-
-
-# Private functions
 
 
 def _make_serper_search(client: httpx.AsyncClient, api_key: str, limit: int, clean_limit: int) -> Tool:

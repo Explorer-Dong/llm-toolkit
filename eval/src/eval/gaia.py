@@ -1,4 +1,4 @@
-"""GAIA text-only: ReAct with web search and page reading."""
+"""GAIA text-only: multi-turn web search benchmark.."""
 
 import argparse
 import asyncio
@@ -39,17 +39,13 @@ Agent reply: {raw}
 
 def parse_args() -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
-    parser = argparse.ArgumentParser(description="ReAct harness for GAIA text-only")
-    runner.add_common_args(parser)
-    parser.add_argument("--level", type=int, choices=(1, 2, 3), help="only run tasks of this GAIA level")
+    parser = argparse.ArgumentParser(description="GAIA")
+    model.add_model_args(parser)
     harness.add_tool_args(parser)
-    parser.add_argument("--max-steps", type=int, default=16, help="maximum tool-use turns per task")
-    parser.add_argument("--search-results", type=int, default=8, help="number of search results per query")
-    parser.add_argument("--observation-chars", type=int, default=12000, help="observation text truncation limit")
-    parser.add_argument("--task-timeout", type=int, default=3600, help="per-task time budget in seconds")
-    args = parser.parse_args()
-    harness.validate_tool_args(parser, args)
-    return args
+    harness.add_agent_args(parser)
+    parser.add_argument("--limit", type=int, default=None, help="run the first N matching tasks")
+    parser.add_argument("--level", type=int, choices=(1, 2, 3), help="only run tasks of this GAIA level")
+    return parser.parse_args()
 
 
 def load_data(path: Path, limit: int | None, level: int | None) -> list[dict[str, Any]]:
@@ -157,7 +153,6 @@ async def solve(task: dict[str, Any], ctx: Context, *, tools: list, args: argpar
 async def amain(
     args: argparse.Namespace,
     tasks: list[dict[str, Any]],
-    params: model.ModelParams,
     output_path,
 ) -> list[dict[str, Any]]:
     async with harness.tool_clients() as (client_search, client_fetch):
@@ -168,7 +163,6 @@ async def amain(
             partial(solve, tools=tools, args=args),
             output_path,
             "GAIA ReAct",
-            params,
             max_active_tasks=args.concurrency,
         )
 
@@ -194,15 +188,7 @@ def main() -> int:
     print(f"Running GAIA tasks with {args.model}; output: {run_dir}")
 
     # run evaluation
-    params = model.ModelParams(
-        model=args.model,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_tokens=args.max_tokens,
-        seed=args.seed,
-        enable_thinking=args.enable_thinking,
-    )
-    records = asyncio.run(amain(args, tasks, params, run_dir / "predictions.json"))
+    records = asyncio.run(amain(args, tasks, run_dir / "predictions.json"))
 
     # log summary after evaluation
     summary = runner.build_summary("GAIA", records, args.model)

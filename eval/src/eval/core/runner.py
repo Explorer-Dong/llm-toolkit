@@ -1,4 +1,4 @@
-"""Run lifecycle: shared CLI args, run directory, progress loop, and run artifacts."""
+"""Run lifecycle: run directory, progress loop, and run artifacts."""
 
 import argparse
 import asyncio
@@ -13,29 +13,9 @@ from typing import Any
 from tqdm import tqdm
 
 from eval import OUTPUT_DIR
-from eval.core.model import Context, ModelParams, build_llm_client
+from eval.core.model import Context, build_llm_client, build_model_params
 
-
-def add_common_args(
-    parser: argparse.ArgumentParser,
-    *,
-    temperature: float = 0.0,
-    max_tokens: int = 8192,
-    timeout: float = 900.0,
-) -> None:
-    """CLI flags shared by every benchmark; benchmark-specific flags go on top."""
-    parser.add_argument("--model", default=os.getenv("MODEL_NAME"))
-    parser.add_argument("--base-url", default=os.getenv("BASE_URL"))
-    parser.add_argument("--api-key", default=os.getenv("API_KEY", "EMPTY"))
-    parser.add_argument("--limit", type=int, default=None, help="run the first N matching tasks")
-    parser.add_argument("--concurrency", type=int, default=4, help="maximum concurrent model requests")
-    parser.add_argument("--temperature", type=float, default=temperature, help="sampling temperature")
-    parser.add_argument("--top-p", type=float, default=0.95, help="nucleus sampling cutoff")
-    parser.add_argument("--max-tokens", type=int, default=max_tokens, help="completion token limit per model request")
-    parser.add_argument("--seed", type=int, default=42, help="sampling seed for reproducible runs")
-    parser.add_argument("--timeout", type=float, default=timeout, help="per model request timeout in seconds")
-    # single-turn benchmarks flip this default to True (thinking is how they answer)
-    parser.add_argument("--enable-thinking", action="store_true", help="enable the model's thinking mode")
+__all__ = ["prepare_run_dir", "run", "make_record", "build_summary"]
 
 
 def prepare_run_dir(
@@ -62,7 +42,6 @@ async def run(
     solve: Callable[[dict[str, Any], Context], Coroutine[Any, Any, dict[str, Any]]],
     output_path: Path,
     desc: str,
-    params: ModelParams,
     *,
     max_active_tasks: int | None = None,
 ) -> list[dict[str, Any]]:
@@ -73,7 +52,7 @@ async def run(
     if max_active_tasks is not None and max_active_tasks < 1:
         raise ValueError("max_active_tasks must be positive")
     client_llm = build_llm_client(api_key=args.api_key, base_url=args.base_url, timeout=args.timeout)
-    ctx = Context(client_llm=client_llm, params=params, sem=asyncio.Semaphore(args.concurrency))
+    ctx = Context(client_llm=client_llm, params=build_model_params(args), sem=asyncio.Semaphore(args.concurrency))
     records: list[dict[str, Any]] = []
     task_iter = iter(tasks)
     active_limit = min(len(tasks), max_active_tasks if max_active_tasks is not None else args.concurrency)

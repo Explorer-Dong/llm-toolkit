@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+__all__ = ["DATA_DIR", "OUTPUT_DIR", "ROOT"]
+
 ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "outputs"

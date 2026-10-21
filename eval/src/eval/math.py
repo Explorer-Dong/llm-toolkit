@@ -45,9 +45,7 @@ SUBJECTS = (
     "Precalculus",
 )
 EXTRACTION_CONFIG = (LatexExtractionConfig(boxed_match_priority=0), ExprExtractionConfig())
-SCORING_METHOD = (
-    "Math-Verify 0.9.0 expression extraction and symbolic equivalence; normalized exact-text fallback when parsing fails"
-)
+SCORING_METHOD = "Math-Verify 0.9.0 expression extraction and symbolic equivalence; normalized exact-text fallback when parsing fails"
 
 SYSTEM_PROMPT = r"""You are solving a competition mathematics problem.
 
@@ -57,11 +55,11 @@ Solve the problem carefully and show your reasoning. End with the final answer i
 
 def parse_args() -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
-    parser = argparse.ArgumentParser(description="Single-turn harness for MATH-500")
-    runner.add_common_args(parser, temperature=1.0, max_tokens=81920, timeout=1800.0)
+    parser = argparse.ArgumentParser(description="MATH-500")
+    model.add_model_args(parser, temperature=1.0, top_k=20, max_tokens=81920, timeout=1800.0)
+    parser.add_argument("--limit", type=int, default=None, help="run the first N matching tasks")
     parser.add_argument("--subject", choices=SUBJECTS, help="only run problems from this subject")
     parser.add_argument("--level", type=int, choices=(1, 2, 3, 4, 5), help="only run problems at this level")
-    parser.add_argument("--top-k", type=int, default=20, help="0 = do not send top_k")
     return parser.parse_args()
 
 
@@ -231,6 +229,7 @@ async def solve(task: dict[str, Any], ctx: Context) -> dict[str, Any]:
 
 
 def main() -> int:
+    # load data
     args = parse_args()
     dataset_path = DATA_DIR / "MATH" / DATASET["file"]
     actual_sha256 = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
@@ -238,6 +237,7 @@ def main() -> int:
         raise ValueError(f"MATH-500 dataset hash mismatch: expected {DATASET['sha256']}, got {actual_sha256}")
     tasks = load_data(dataset_path, args.limit, args.subject, args.level)
 
+    # prepare running folder
     run_dir = runner.prepare_run_dir(
         "MATH",
         args,
@@ -255,17 +255,10 @@ def main() -> int:
     )
     print(f"Running {len(tasks)} MATH-500 tasks with {args.model}; output: {run_dir}")
 
-    params = model.ModelParams(
-        model=args.model,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_tokens=args.max_tokens,
-        seed=args.seed,
-        enable_thinking=args.enable_thinking,
-        extra_body={"top_k": args.top_k} if args.top_k else None,
-    )
-    records = asyncio.run(runner.run(args, tasks, solve, run_dir / "predictions.json", DATASET["name"], params))
+    # run evaluation
+    records = asyncio.run(runner.run(args, tasks, solve, run_dir / "predictions.json", DATASET["name"]))
 
+    # log summary after evaluation
     summary = runner.build_summary(DATASET["name"], records, args.model)
     for field, key in (("subject", "by_subject"), ("level", "by_level")):
         groups = sorted({record[field] for record in records}, key=lambda value: (value is None, str(value)))

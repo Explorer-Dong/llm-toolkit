@@ -40,10 +40,10 @@ eval/
 ├── data/<bench>/       # dataset of each bench
 ├── src/eval/
 │   ├── core/
-│   │   ├── model.py    # streaming model call, ModelParams/Context, per-call capture
-│   │   ├── harness.py  # tool use and agent framework
-│   │   ├── runner.py   # run loop, run dir/config, records, summary, common CLI args
-│   │   └── utils.py    # neutral helpers shared by benchmarks
+│   │   ├── harness.py  # tool/agent CLI args, tool use and agent framework
+│   │   ├── model.py    # model CLI args, request parameters, streaming model calls
+│   │   ├── runner.py   # run loop, run dir/config, records, summary
+│   │   └── utils.py    # shared helpers
 │   ├── aime.py
 │   ├── browsecomp.py
 │   └── <bench>.py      # other bench

@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from eval import ROOT
 from eval.core import harness
 
-# Globals
+__all__ = ["main"]
 
 TOOL_ENV = {
     "serper-search": ("SERPER_API_KEY",),
@@ -23,10 +23,13 @@ TOOL_ENV = {
 ALL_TOOLS = tuple(TOOL_ENV)
 
 
-# Public functions
+def main() -> int:
+    args = _parse_args()
+    names = list(ALL_TOOLS) if args.all else args.tool
+    return asyncio.run(_run_selected(names, args.query, args.url))
 
 
-def parse_args() -> argparse.Namespace:
+def _parse_args() -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(description="Smoke-test real search and fetch tool APIs")
     selection = parser.add_mutually_exclusive_group(required=True)
@@ -37,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def run_tool(name: str, query: str, url: str) -> str:
+async def _run_tool(name: str, query: str, url: str) -> str:
     missing = [key for key in TOOL_ENV[name] if not os.getenv(key, "").strip()]
     if missing:
         raise ValueError(f"missing configuration: {', '.join(missing)}")
@@ -87,19 +90,13 @@ async def _run_selected(names: list[str], query: str, url: str) -> int:
     failed = False
     for name in names:
         try:
-            summary = await run_tool(name, query, url)
+            summary = await _run_tool(name, query, url)
         except Exception as exc:  # noqa: BLE001 - report each provider and continue through --all
             failed = True
             print(f"FAIL {name}: {_redact(f'{type(exc).__name__}: {exc}')}")
         else:
             print(f"PASS {name}: {summary}")
     return int(failed)
-
-
-def main() -> int:
-    args = parse_args()
-    names = list(ALL_TOOLS) if args.all else args.tool
-    return asyncio.run(_run_selected(names, args.query, args.url))
 
 
 if __name__ == "__main__":

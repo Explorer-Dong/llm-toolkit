@@ -31,10 +31,10 @@ Final output format:
 
 def parse_args() -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
-    parser = argparse.ArgumentParser(description="Single-turn harness for AIME")
-    runner.add_common_args(parser, temperature=1.0, max_tokens=81920, timeout=1800.0)
+    parser = argparse.ArgumentParser(description="AIME")
+    model.add_model_args(parser, temperature=1.0, top_k=20, max_tokens=81920, timeout=1800.0)
+    parser.add_argument("--limit", type=int, default=None, help="run the first N matching tasks")
     parser.add_argument("--year", type=int, default=2026, help="AIME year to evaluate (loads data/aime<year>.json)")
-    parser.add_argument("--top-k", type=int, default=20, help="0 = do not send top_k")
     return parser.parse_args()
 
 
@@ -123,16 +123,7 @@ def main() -> int:
     print(f"Running AIME{args.year} tasks with {args.model}; output: {run_dir}")
 
     # run evaluation
-    params = model.ModelParams(
-        model=args.model,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_tokens=args.max_tokens,
-        seed=args.seed,
-        enable_thinking=args.enable_thinking,
-        extra_body={"top_k": args.top_k} if args.top_k else None,
-    )
-    records = asyncio.run(runner.run(args, tasks, solve, run_dir / "predictions.json", f"AIME{args.year}", params))
+    records = asyncio.run(runner.run(args, tasks, solve, run_dir / "predictions.json", f"AIME{args.year}"))
 
     # log summary after evaluation
     summary = runner.build_summary(f"AIME{args.year}", records, args.model)

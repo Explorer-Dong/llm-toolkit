@@ -15,7 +15,7 @@ import httpx
 from eval import browsecomp, gaia, webwalkerqa
 from eval.core import harness, runner
 
-# Globals
+__all__ = []
 
 BENCHMARKS = (browsecomp, gaia, webwalkerqa)
 TEST_ENV = {
@@ -27,14 +27,10 @@ TEST_ENV = {
     "CRAWL4AI_TOKEN": "crawler-secret",
 }
 
-# Classes
-
 
 class ToolCliTests(unittest.TestCase):
     def test_all_entrypoints_and_provider_combinations(self):
-        for module, search, fetch in itertools.product(
-            BENCHMARKS, ("serper", "deepseek"), ("crawl4ai", "deepseek")
-        ):
+        for module, search, fetch in itertools.product(BENCHMARKS, ("serper", "deepseek"), ("crawl4ai", "deepseek")):
             with self.subTest(module=module.__name__, search=search, fetch=fetch):
                 flags = ["--search-provider", search, "--fetch-provider", fetch]
                 args = _parse_args(module, flags)
@@ -43,7 +39,7 @@ class ToolCliTests(unittest.TestCase):
             args = _parse_args(module)
             self.assertEqual((args.search_provider, args.fetch_provider), ("serper", "crawl4ai"))
 
-    def test_only_selected_credentials_are_required_and_cli_can_override_env(self):
+    def test_credentials_load_from_env_and_cli_can_override(self):
         flags = ["--search-provider", "deepseek", "--fetch-provider", "deepseek"]
         for module in BENCHMARKS:
             args = _parse_args(module, flags, {key: value for key, value in TEST_ENV.items() if key.startswith("DS_")})
@@ -53,10 +49,20 @@ class ToolCliTests(unittest.TestCase):
                 [*flags, "--ds-tool-url", "https://override.example/v1", "--ds-tool-key", "override"],
             )
             self.assertEqual((args.ds_tool_url, args.ds_tool_key), ("https://override.example/v1", "override"))
-            for extra, env in (([], {}), (["--search-results", "51"], TEST_ENV)):
-                with self.subTest(module=module.__name__, extra=extra), contextlib.redirect_stderr(io.StringIO()):
+            args = _parse_args(module, flags, {})
+            self.assertEqual((args.ds_tool_url, args.ds_tool_key), ("", ""))
+
+    def test_invalid_providers_and_search_result_counts_are_rejected(self):
+        for module in BENCHMARKS:
+            for flags in (
+                ["--search-provider", "invalid"],
+                ["--fetch-provider", "invalid"],
+                ["--search-results", "0"],
+                ["--search-results", "51"],
+            ):
+                with self.subTest(module=module.__name__, flags=flags), contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit) as exc:
-                        _parse_args(module, [*flags, *extra], env)
+                        _parse_args(module, flags)
                     self.assertEqual(exc.exception.code, 2)
 
     def test_run_config_records_providers_and_excludes_credentials(self):
@@ -275,9 +281,6 @@ class HttpRetryTests(unittest.IsolatedAsyncioTestCase):
                     result = await harness._execute_tool(fetch, {"url": "https://example.com"})
                 self.assertIn(str(status), result)
                 self.assertEqual(len(attempts), 3 if status >= 500 or status in (408, 429) else 1)
-
-
-# Private functions
 
 
 def _parse_args(module=browsecomp, flags=(), env=None):
