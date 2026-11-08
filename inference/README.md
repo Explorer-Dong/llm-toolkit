@@ -1,4 +1,4 @@
-# LLM Serving
+# inference
 
 Serve models for high-performance inference.
 
@@ -14,7 +14,7 @@ uvx hf download Qwen/Qwen3.5-9B --local-dir /path/to/Qwen3.5-9B
 uvx modelscope download Qwen/Qwen3.5-9B --local_dir /path/to/Qwen3.5-9B
 ```
 
-## Serve with docker
+## Inference with docker
 
 ### (Optional) Persist image
 
@@ -114,32 +114,34 @@ docker run -d \
     --reasoning-parser $REASONING_PARSER
 ```
 
-## Serve with binary
+## Inference with binary
 
 ### Install binary
 
 > [!tip]
 >
-> Let agent help you setup binary is a good choice, as runtime-environment is very complex.
+> Let agent help you setup binary is a good idea, as runtime-environment is very complex.
 
-Example from official docs:
+Example installation for vLLM on `cu>=12.1,<13`:
 
 ```bash
-uv venv --python 3.12 --seed --managed-python
-source .vene/bin/activate
+uv venv --python 3.12
+uv pip install "vllm==0.30.0" --torch-backend=cu129
+uv pip install "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl"
+```
 
-# vllm
-uv pip install vllm --torch-backend=auto
+Verify installation:
 
-# sglang
-uv pip install sglang --prerelease=allow
+```bash
+uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+uv run python -c "import vllm; print(vllm.__version__)"
 ```
 
 ### Start inference engine
 
 ```bash
-export API_KEY=sk-vincent
-export MODEL_PATH=/data/dongwenjie/llm-toolkit/_models/Qwen3.5-9B
+export API_KEY=sk-xxx
+export MODEL_PATH=/path/to/Qwen3.5-9B
 export MODEL_NAME=Qwen3.5-9B
 export TOOL_CALL_PARSER=qwen3_coder
 export REASONING_PARSER=qwen3
@@ -180,14 +182,14 @@ sglang serve \
   --reasoning-parser $REASONING_PARSER
 ```
 
-## Check server
+## Verify service
 
 ```bash
-# check model list
+# verify model list
 curl http://127.0.0.1:8000/v1/models \
   -H "Authorization: Bearer $API_KEY" | jq
 
-# check simple request
+# verify simple request
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
