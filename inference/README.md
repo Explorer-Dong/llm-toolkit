@@ -1,4 +1,4 @@
-# inference
+# Model Inference
 
 Serve models for high-performance inference.
 

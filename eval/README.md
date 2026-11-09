@@ -1,4 +1,4 @@
-# eval
+# Model Evaluation
 
 Unified evaluation harness for the LLM benchmarks.
 

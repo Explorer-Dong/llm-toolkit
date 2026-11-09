@@ -1,4 +1,4 @@
-# LLM Training
+# Model Training
 
 We train LLM in multiple steps.
 
