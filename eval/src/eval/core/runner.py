@@ -40,9 +40,11 @@ def prepare_run_dir(
     secrets: set[str],
     extra: dict[str, Any] | None = None,
 ) -> Path:
-    """Create outputs/<benchmark>/<timestamp>_<model>/ and write config.json with secrets filtered."""
-    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = OUTPUT_DIR / benchmark / f"{timestamp}_{re.sub(r'[^A-Za-z0-9_.-]+', '-', args.model)}"
+    """Create outputs/<benchmark>/<model>_<timestamp>/ and write config.json with secrets filtered."""
+
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    model = re.sub(r'[^A-Za-z0-9_.-]+', '-', args.model).lower()
+    run_dir = OUTPUT_DIR / benchmark / f"{model}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     config = {key: str(value) for key, value in vars(args).items() if key not in secrets}
     if extra:

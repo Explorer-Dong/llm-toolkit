@@ -31,13 +31,13 @@ uv run webwalkerqa --enable-thinking
 uv run <benchmark> --help
 ```
 
-Results will be stored in `outputs/<benchmark>/<timestamp>_<model>/`.
+Results will be stored in `outputs/<benchmark>/<model>_<timestamp>/`.
 
 ## Layout
 
 ```
 eval/
-├── data/<benchmark>/       # dataset of each benchmark
+├── data/<benchmark>/   # dataset of each benchmark
 ├── src/eval/
 │   ├── core/
 │   │   ├── harness.py  # tools, agent paradigms
@@ -47,7 +47,7 @@ eval/
 │   │   └── utils.py    # shared helpers
 │   ├── aime.py
 │   ├── browsecomp.py
-│   └── <benchmark>.py      # other benchmarks
+│   └── <benchmark>.py  # other benchmarks
 ├── tests/              # unit tests
 └── docker-compose.yml  # start tool server locally
 ```
