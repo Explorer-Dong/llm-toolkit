@@ -2,6 +2,14 @@
 
 Unified evaluation harness for the LLM benchmarks.
 
+Features:
+
+- [x] Support single-turn benchmarks, such as QA tasks.
+- [x] Support multi-turn benchmarks, such as Agentic tasks.
+- [ ] Support resume inference.
+- [ ] Support resume llm-as-a-judge.
+- [ ] Support sandbox benchmarks, such as Container-based tasks.
+
 ## Run
 
 From `eval/`:
@@ -11,7 +19,7 @@ Setup env:
 ```bash
 uv sync --group dev
 cp .env.example .env   # fill in the keys
-docker compose up -d   # (Optional) needed only for the default fetch service Crawl4AI
+docker compose up -d   # (Optional) needed only for the fetch service Crawl4AI
 ```
 
 Start evaluation:
@@ -24,7 +32,7 @@ uv run math --enable-thinking
 
 # multi-turn benchmark
 uv run browsecomp --enable-thinking
-uv run gaia --enable-thinking --search-provider deepseek --fetch-provider deepseek
+uv run gaia --enable-thinking
 uv run webwalkerqa --enable-thinking
 
 # see more options:
