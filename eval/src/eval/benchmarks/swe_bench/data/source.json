@@ -1,0 +1,9 @@
+{
+  "dataset": "SWE-bench/SWE-bench_Verified",
+  "revision": "78f471bf655a3137b2e8a75af1501690ec009ec3",
+  "split": "test",
+  "filter": {
+    "difficulty": "<15 min fix"
+  },
+  "num_samples": 194
+}

@@ -5,12 +5,11 @@ import asyncio
 import json
 import os
 import sys
-from argparse import Namespace
 
 from dotenv import load_dotenv
+from harness.tool import ToolConfig, common_server, open_toolbox
 
 from eval import ROOT
-from eval.core import harness
 
 __all__ = ["main"]
 
@@ -47,7 +46,7 @@ async def _run_tool(name: str, query: str, url: str) -> str:
 
     search_provider = "deepseek" if name == "deepseek-search" else "serper"
     fetch_provider = "deepseek" if name == "deepseek-fetch" else "crawl4ai"
-    args = Namespace(
+    config = ToolConfig(
         search_provider=search_provider,
         fetch_provider=fetch_provider,
         serper_api_key=os.getenv("SERPER_API_KEY", ""),
@@ -59,11 +58,12 @@ async def _run_tool(name: str, query: str, url: str) -> str:
         observation_chars=12000,
     )
 
-    async with harness.tool_clients() as (client_search, client_fetch):
-        tools = harness.make_tools(client_search, client_fetch, args)
-        is_search = name.endswith("-search")
-        tool = tools[0] if is_search else tools[1]
-        result = await asyncio.wait_for(tool.run(query if is_search else url), timeout=tool.timeout + 10)
+    is_search = name.endswith("-search")
+    async with open_toolbox(common_server(config)) as tools:
+        response = await tools.call("search" if is_search else "fetch", {"query": query} if is_search else {"url": url})
+    if response.fatal is not None or response.is_error:
+        raise RuntimeError(response.fatal or response.content)
+    result = response.content
 
     if result.startswith(("Tool error:", "No search results", "The crawler failed")):
         raise RuntimeError(result)

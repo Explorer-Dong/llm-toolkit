@@ -1,0 +1,264 @@
+"""Each benchmark loads local assets, builds isolated agent input, and scores offline."""
+
+import asyncio
+import contextlib
+import hashlib
+import importlib
+import io
+import itertools
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from harness import agent, model
+from mcp.server.fastmcp import FastMCP
+
+from eval import inference as eval_inference
+from eval import scoring as eval_scoring
+
+__all__ = []
+BENCHMARKS = ("aime", "gpqa", "math", "gaia", "browsecomp", "webwalkerqa")
+WEB = ("gaia", "browsecomp", "webwalkerqa")
+TEST_ENV = {
+    "MODEL_NAME": "test",
+    "SERPER_API_KEY": "serper-secret",
+    "DS_TOOL_KEY": "ds-secret",
+    "DS_TOOL_URL": "https://tools.example",
+    "CRAWL4AI_TOKEN": "crawler-secret",
+    "CRAWL4AI_URL": "https://crawler.example",
+}
+PARAMS = model.ModelParams("test", 0, 1, 1024, 42)
+
+
+class BenchmarkTests(unittest.TestCase):
+    def test_each_benchmark_loads_self_contained_data_and_filters(self):
+        for name in BENCHMARKS:
+            with self.subTest(benchmark=name):
+                bench = importlib.import_module(f"eval.benchmarks.{name}.inference")
+                args = _args(bench, ["--limit", "1"])
+                sample = bench.load_tasks(args)[0]
+                task = bench.build_task(sample, args)
+                self.assertEqual(task.id, sample["id"])
+                self.assertEqual(task.meta, sample["meta"])
+                self.assertEqual(task.max_turns, 16 if name in WEB else 1)
+                altered = dict(sample, gold="SECRET_REFERENCE_SENTINEL")
+                self.assertNotIn("SECRET_REFERENCE_SENTINEL", str(bench.build_task(altered, args)))
+                module = importlib.import_module(f"eval.benchmarks.{name}.inference")
+                self.assertEqual(Path(module.DATA).parent.name, name)
+                self.assertTrue(any(Path(module.DATA).glob("*.json")))
+                if name == "math":
+                    args.subject, args.level = sample["subject"], sample["level"]
+                elif name == "gaia":
+                    args.level = sample["level"]
+                elif name == "browsecomp":
+                    args.topic = sample["topic"]
+                elif name == "webwalkerqa":
+                    args.type, args.difficulty = sample["type"], sample["difficulty"]
+                self.assertEqual(bench.load_tasks(args)[0]["id"], sample["id"])
+        bench = importlib.import_module("eval.benchmarks.aime.inference")
+        for year in (2024, 2025, 2026):
+            self.assertTrue(bench.load_tasks(_args(bench, ["--year", str(year)])))
+
+    def test_generation_defaults_budget_alias_and_concurrency_controls(self):
+        for name in (*BENCHMARKS, "swe_bench"):
+            bench = importlib.import_module(f"eval.benchmarks.{name}.inference")
+            args = _args(bench)
+            self.assertEqual(args.sample_concurrency, args.concurrency)
+            self.assertFalse(hasattr(args, "judge_model"))
+            self.assertTrue(args.enable_thinking)
+            self.assertEqual(args.reasoning_effort, "medium")
+            selected = _args(bench, ["--disable-thinking", "--reasoning-effort", "high"])
+            params = model.build_model_params(selected)
+            self.assertFalse(params.enable_thinking)
+            self.assertEqual(params.reasoning_effort, "high")
+            if name not in WEB and name != "swe_bench":
+                self.assertEqual((args.max_turns, args.max_tokens, args.temperature, args.top_k), (1, 81920, 1, 20))
+            args = _args(
+                bench,
+                [
+                    "--max-steps",
+                    "3",
+                    "--top-k",
+                    "0",
+                    "--task-timeout",
+                    "0",
+                    "--concurrency",
+                    "4",
+                    "--sample-concurrency",
+                    "1",
+                ],
+            )
+            self.assertEqual(
+                (args.max_turns, args.top_k, args.task_timeout, args.concurrency, args.sample_concurrency),
+                (3, 0, 0, 4, 1),
+            )
+
+    def test_common_provider_combinations_credentials_and_default_shared_server(self):
+        for name, search, fetch in itertools.product(WEB, ("serper", "deepseek"), ("crawl4ai", "deepseek")):
+            bench = importlib.import_module(f"eval.benchmarks.{name}.inference")
+            args = _args(bench, ["--search-provider", search, "--fetch-provider", fetch])
+            self.assertEqual((args.search_provider, args.fetch_provider), (search, fetch))
+            self.assertEqual((args.ds_tool_key, args.serper_api_key), ("ds-secret", "serper-secret"))
+            with (
+                patch.dict(os.environ, TEST_ENV, clear=True),
+                patch.object(bench, "load_dotenv"),
+                patch.object(bench, "load_tasks", return_value=[]),
+                patch.object(bench, "common_server", wraps=bench.common_server) as server,
+                patch.object(eval_inference, "run_inference", new_callable=AsyncMock, return_value=[]) as execute,
+            ):
+                self.assertEqual(bench.main(["--search-provider", search, "--fetch-provider", fetch]), 0)
+            config = server.call_args.args[0]
+            self.assertEqual((config.search_provider, config.fetch_provider), (search, fetch))
+            servers = execute.call_args.kwargs["shared_servers"]
+            self.assertEqual(len(servers), 1)
+            self.assertIsInstance(servers[0], FastMCP)
+            self.assertEqual(servers[0].name, "common")
+        for name in WEB:
+            with self.subTest(benchmark=name):
+                args = _args(importlib.import_module(f"eval.benchmarks.{name}.inference"))
+                self.assertEqual((args.search_provider, args.fetch_provider), ("deepseek", "deepseek"))
+        args = _args(importlib.import_module("eval.benchmarks.gaia.inference"), ["--ds-tool-key", "override"])
+        self.assertEqual(args.ds_tool_key, "override")
+
+    def test_invalid_limits_providers_and_names_are_rejected(self):
+        for flags in (
+            ["--limit", "0"],
+            ["--concurrency", "0"],
+            ["--sample-concurrency", "0"],
+            ["--max-turns", "0"],
+            ["--task-timeout", "-1"],
+            ["--search-results", "51"],
+            ["--search-provider", "invalid"],
+            ["--fetch-provider", "invalid"],
+        ):
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _args(importlib.import_module("eval.benchmarks.gaia.inference"), flags)
+        for entry, name in itertools.product((eval_inference, eval_scoring), ("../aime", "a.b", "AIME")):
+            with (
+                self.subTest(entry=entry.__name__, benchmark=name),
+                patch.object(sys, "argv", [entry.__name__, name]),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                entry.main()
+
+    def test_benchmark_modules_and_stage_entrypoint_help(self):
+        for name, stage in itertools.product((*BENCHMARKS, "swe_bench"), ("inference", "scoring")):
+            with self.subTest(benchmark=name, stage=stage):
+                result = subprocess.run(
+                    [sys.executable, "-m", f"eval.benchmarks.{name}.{stage}", "--help"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("--sample-concurrency", result.stdout)
+                if stage == "scoring":
+                    self.assertEqual("--judge-model" in result.stdout, name in ("browsecomp", "webwalkerqa"))
+        for stage in ("inference", "scoring"):
+            result = subprocess.run(
+                [sys.executable, "-m", f"eval.{stage}", "aime", "--help"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--sample-concurrency", result.stdout)
+
+
+class PipelineSmokeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_six_benchmarks_generate_then_score_from_original_datasets(self):
+        for name in BENCHMARKS:
+            with self.subTest(benchmark=name), tempfile.TemporaryDirectory() as tmp:
+                bench = importlib.import_module(f"eval.benchmarks.{name}.inference")
+                grader = importlib.import_module(f"eval.benchmarks.{name}.scoring")
+                args = _args(bench, ["--limit", "1", "--output-dir", str(Path(tmp) / "run")])
+                sample = bench.load_tasks(args)[0]
+                content = (
+                    str(sample["gold"])
+                    if name in ("browsecomp", "webwalkerqa")
+                    else json.dumps({"answer": sample["gold"]})
+                )
+                if name == "math":
+                    content = rf"\boxed{{{sample['gold']}}}"
+                ctx = model.Context(MagicMock(close=AsyncMock()), PARAMS, asyncio.Semaphore(1))
+                with (
+                    patch.object(eval_inference, "make_context", return_value=ctx) as inference_context,
+                    patch.object(agent, "call_model", return_value=model.AssistantTurn(content)) as call,
+                ):
+                    traces = await eval_inference.run_inference(
+                        args,
+                        [sample],
+                        [bench.build_task(sample, args)],
+                        shared_servers=[FastMCP("common")] if name in WEB else [],
+                    )
+                inference_context.assert_called_once()
+                self.assertEqual(call.await_count, 1)
+                self.assertIsNone(traces[0].error)
+                run_dir = Path(args.output_dir)
+                self.assertEqual({p.name for p in run_dir.iterdir()}, {"config.json", "trajectories"})
+                config = json.loads((run_dir / "config.json").read_text())
+                self.assertEqual(config["sample_ids"], [sample["id"]])
+                self.assertEqual(
+                    config["dataset_sha256"], hashlib.sha256(Path(args.dataset_file).read_bytes()).hexdigest()
+                )
+                before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in run_dir.rglob("*") if p.is_file()}
+                judge_client = MagicMock(close=AsyncMock())
+                judge_ctx = model.Context(judge_client, PARAMS, asyncio.Semaphore(1))
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(
+                            eval_inference,
+                            "make_context",
+                            side_effect=AssertionError("Inference called during scoring"),
+                        )
+                    )
+                    if name in ("browsecomp", "webwalkerqa"):
+                        build = stack.enter_context(patch.object(grader, "make_context", return_value=judge_ctx))
+                        stack.enter_context(patch.object(grader, "load_dotenv"))
+                        stack.enter_context(
+                            patch.object(grader, "call_model", return_value=model.AssistantTurn("correct: yes"))
+                        )
+                    if name == "math":
+                        # Math-Verify uses signal-based timeouts on the process's main thread.
+                        scored = await asyncio.to_thread(
+                            subprocess.run,
+                            [sys.executable, "-m", "eval.benchmarks.math.scoring", str(run_dir)],
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        self.assertEqual(scored.returncode, 0, scored.stderr)
+                    else:
+                        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                        self.assertEqual(await asyncio.to_thread(grader.main, [str(run_dir)]), 0)
+                output = next((run_dir / "scores").iterdir())
+                summary = json.loads((output / "summary.json").read_text())
+                self.assertEqual((summary["num_tasks"], summary["correct"], summary["sys_errors"]), (1, 1, 0))
+                for path, digest in before.items():
+                    self.assertEqual(hashlib.sha256(Path(path).read_bytes()).hexdigest(), digest)
+                self.assertEqual(
+                    {p.name for p in output.iterdir()}, {"config.json", "trajectories.json", "summary.json"}
+                )
+                score_config = json.loads((output / "config.json").read_text())
+                self.assertEqual(len(score_config["source_sha256"]), 2)
+                self.assertNotIn("judge_api_key", score_config)
+                if name in ("browsecomp", "webwalkerqa"):
+                    build.assert_called_once()
+                    self.assertTrue(build.call_args.args[2].enable_thinking)
+                    self.assertEqual(build.call_args.args[2].reasoning_effort, "medium")
+                    judge_client.close.assert_awaited_once()
+
+
+def _args(bench, flags=()):
+    with patch.dict(os.environ, TEST_ENV, clear=True), patch.object(bench, "load_dotenv"):
+        return bench.parse_args(flags)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -4,3 +4,8 @@ __pycache__
 uv.lock
 
 outputs
+
+src/eval/benchmarks/*/data/downloads/
+src/eval/benchmarks/*/data/files/
+src/eval/benchmarks/*/data/*.parquet
+src/eval/benchmarks/*/data/*.arrow

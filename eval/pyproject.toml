@@ -1,32 +1,34 @@
 [project]
 name = "eval"
-version = "0.1.0"
-description = "Evaluation harness for the LLM benchmarks."
+version = "0.0.1"
+description = "Benchmark for agent including inference and scoring stage."
 readme = "README.md"
 authors = [
     { name = "Vincent", email = "explorer-dong@foxmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "httpx>=0.27",
+    "harness",
     "math-verify[antlr4-13-2]==0.9.0",
-    "openai>=1.0",
     "python-dotenv>=1.0",
     "tqdm>=4.66",
 ]
 
+[project.optional-dependencies]
+swe_bench = ["swebench==5.0.2"]
+
 [project.scripts]
-aime = "eval.aime:main"
-gpqa = "eval.gpqa:main"
-gaia = "eval.gaia:main"
-browsecomp = "eval.browsecomp:main"
-webwalkerqa = "eval.webwalkerqa:main"
-math = "eval.math:main"
+eval-inference = "eval.inference:main"
+eval-scoring = "eval.scoring:main"
+
+[tool.uv.sources]
+harness = { path = "../harness", editable = true }
 
 [dependency-groups]
 dev = [
     "ruff>=0.16",
     "ty>=0.0.84",
+    "playwright>=1.58,<2",
 ]
 
 [build-system]
@@ -35,11 +37,12 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "DTZ"]
 
 [tool.ruff.lint.per-file-ignores]
 # benchmark prompt strings are prose and kept verbatim
-"src/eval/*.py" = ["E501"]
+"src/eval/benchmarks/*/inference.py" = ["E501"]
+"src/eval/benchmarks/*/scoring.py" = ["E501"]
