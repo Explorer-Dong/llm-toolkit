@@ -1,7 +1,9 @@
 """CLI dispatchers for benchmark rollout and scoring commands."""
 
 import argparse
+import asyncio
 import importlib
+import json
 import re
 import sys
 
@@ -15,7 +17,9 @@ def rollout_main() -> int:
     if not re.fullmatch(r"[a-z][a-z0-9_]*", args.benchmark):
         parser.error("benchmark names must use snake_case")
     module = importlib.import_module(f"..{args.benchmark}.rollout", package=__package__)
-    return module.main(sys.argv[2:])
+    bench_args = module.parse_args(sys.argv[2:])
+    asyncio.run(module.rollout(bench_args, module.load_tasks(bench_args)))
+    return 0
 
 
 def scoring_main() -> int:
@@ -25,4 +29,8 @@ def scoring_main() -> int:
     if not re.fullmatch(r"[a-z][a-z0-9_]*", args.benchmark):
         parser.error("benchmark names must use snake_case")
     module = importlib.import_module(f"..{args.benchmark}.scoring", package=__package__)
-    return module.main(sys.argv[2:])
+    score_args = module.parse_args(sys.argv[2:])
+    output, summary = asyncio.run(module.run_score(score_args))
+    print(f"Scores: {output}")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0

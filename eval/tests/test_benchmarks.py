@@ -16,10 +16,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp.server.fastmcp import FastMCP
 
-from eval import agent
+from eval import agent, model
+from eval.agent import Task
 from eval.benchmarks._common import cli
-from eval.model import openai as model
-from eval.model.utils import build_model_params
+from eval.model import build_model_params
 
 __all__ = []
 BENCHMARKS = ("aime", "gpqa", "math", "gaia", "browsecomp", "webwalkerqa")
@@ -32,7 +32,6 @@ TEST_ENV = {
     "CRAWL4AI_TOKEN": "crawler-secret",
     "CRAWL4AI_URL": "https://crawler.example",
 }
-PARAMS = model.ModelParams("test", 0, 1, 1024, 42)
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -41,24 +40,20 @@ class BenchmarkTests(unittest.TestCase):
             with self.subTest(benchmark=name):
                 bench = importlib.import_module(f"eval.benchmarks.{name}.rollout")
                 args = _args(bench, ["--limit", "1"])
-                sample = bench.load_tasks(args)[0]
-                task = bench.build_task(sample, args)
-                self.assertEqual(task.id, sample["id"])
-                self.assertEqual(task.meta, sample["meta"])
+                task = bench.load_tasks(args)[0]
                 self.assertEqual(task.max_turns, 16 if name in WEB else 1)
-                altered = dict(sample, gold="SECRET_REFERENCE_SENTINEL")
-                self.assertNotIn("SECRET_REFERENCE_SENTINEL", str(bench.build_task(altered, args)))
+                self.assertNotIn("gold", str(task))
                 self.assertEqual(Path(bench.DATA).parent.name, name)
                 self.assertTrue(any(Path(bench.DATA).glob("*.json")))
                 if name == "math":
-                    args.subject, args.level = sample["subject"], sample["level"]
+                    args.subject, args.level = task.meta["subject"], task.meta["level"]
                 elif name == "gaia":
-                    args.level = sample["level"]
+                    args.level = task.meta["level"]
                 elif name == "browsecomp":
-                    args.topic = sample["topic"]
+                    args.topic = task.meta["topic"]
                 elif name == "webwalkerqa":
-                    args.type, args.difficulty = sample["type"], sample["difficulty"]
-                self.assertEqual(bench.load_tasks(args)[0]["id"], sample["id"])
+                    args.type, args.difficulty = task.meta["type"], task.meta["difficulty"]
+                self.assertEqual(bench.load_tasks(args)[0].id, task.id)
         bench = importlib.import_module("eval.benchmarks.aime.rollout")
         for year in (2024, 2025, 2026):
             self.assertTrue(bench.load_tasks(_args(bench, ["--year", str(year)])))
@@ -67,14 +62,15 @@ class BenchmarkTests(unittest.TestCase):
         for name in (*BENCHMARKS, "swe_bench"):
             bench = importlib.import_module(f"eval.benchmarks.{name}.rollout")
             args = _args(bench)
-            self.assertEqual(args.sample_concurrency, args.concurrency)
+            expected_concurrency = 6 if name in ("browsecomp", "webwalkerqa") else (2 if name == "swe_bench" else 4)
+            self.assertEqual(args.concurrency, expected_concurrency)
             self.assertFalse(hasattr(args, "judge_model"))
             self.assertTrue(args.enable_thinking)
             self.assertEqual(args.reasoning_effort, "medium")
             selected = _args(bench, ["--no-enable-thinking", "--reasoning-effort", "high"])
             params = build_model_params(selected)
-            self.assertFalse(params.enable_thinking)
-            self.assertEqual(params.reasoning_effort, "high")
+            self.assertFalse(params["enable_thinking"])
+            self.assertEqual(params["reasoning_effort"], "high")
             if name not in WEB and name != "swe_bench":
                 self.assertEqual((args.max_turns, args.max_tokens, args.temperature, args.top_k), (1, 81920, 1, 20))
             args = _args(
@@ -87,14 +83,12 @@ class BenchmarkTests(unittest.TestCase):
                     "--task-timeout",
                     "0",
                     "--concurrency",
-                    "4",
-                    "--sample-concurrency",
-                    "1",
+                    "5",
                 ],
             )
             self.assertEqual(
-                (args.max_turns, args.top_k, args.task_timeout, args.concurrency, args.sample_concurrency),
-                (3, 0, 0, 4, 1),
+                (args.max_turns, args.top_k, args.task_timeout, args.concurrency),
+                (3, 0, 0, 5),
             )
 
     def test_common_provider_combinations_credentials_and_default_shared_server(self):
@@ -105,25 +99,25 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual((args.ds_tool_key, args.serper_api_key), ("ds-secret", "serper-secret"))
             with (
                 patch.dict(os.environ, TEST_ENV, clear=True),
+                patch.object(sys, "argv", ["rollout", name, "--search-provider", search, "--fetch-provider", fetch]),
                 patch.object(bench, "load_dotenv"),
                 patch.object(bench, "load_tasks", return_value=[]),
                 patch.object(bench, "common_server", wraps=bench.common_server) as server,
                 patch.object(bench, "open_toolbox", wraps=bench.open_toolbox),
-                patch.object(bench, "run_rollout", new_callable=AsyncMock, return_value=[]),
+                patch.object(bench, "rollout", new_callable=AsyncMock, return_value=[]),
             ):
-                self.assertEqual(bench.main(["--search-provider", search, "--fetch-provider", fetch]), 0)
+                self.assertEqual(cli.rollout_main(), 0)
             with tempfile.TemporaryDirectory() as tmp:
                 run_args = _args(
                     bench,
                     ["--search-provider", search, "--fetch-provider", fetch, "--output-dir", str(Path(tmp) / "run")],
                 )
-                ctx = model.Context(MagicMock(close=AsyncMock()), PARAMS, asyncio.Semaphore(1))
                 with (
-                    patch.object(bench, "make_context", return_value=ctx),
+                    patch.object(bench, "make_client", return_value=_mock_client()),
                     patch.object(bench, "common_server", return_value=FastMCP("common")) as server,
                     patch.object(agent, "call_model", return_value=model.AssistantTurn("answer")),
                 ):
-                    asyncio.run(bench.run_rollout(run_args, [{"id": "1", "question": "Q", "gold": "A", "meta": {}}]))
+                    asyncio.run(bench.rollout(run_args, [Task("1", "s", "Q", gold="A")]))
                 config = server.call_args.args[0]
                 self.assertEqual((config.search_provider, config.fetch_provider), (search, fetch))
         for name in WEB:
@@ -137,7 +131,6 @@ class BenchmarkTests(unittest.TestCase):
         for flags in (
             ["--limit", "0"],
             ["--concurrency", "0"],
-            ["--sample-concurrency", "0"],
             ["--max-turns", "0"],
             ["--task-timeout", "-1"],
             ["--search-results", "51"],
@@ -165,7 +158,7 @@ class BenchmarkTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("--sample-concurrency", result.stdout)
+                self.assertIn("--concurrency", result.stdout)
                 if stage == "scoring":
                     self.assertEqual("--judge-model" in result.stdout, name in ("browsecomp", "webwalkerqa"))
         for script in ("rollout", "scoring"):
@@ -176,7 +169,7 @@ class BenchmarkTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("--sample-concurrency", result.stdout)
+            self.assertIn("--concurrency", result.stdout)
 
 
 class PipelineSmokeTests(unittest.IsolatedAsyncioTestCase):
@@ -186,45 +179,41 @@ class PipelineSmokeTests(unittest.IsolatedAsyncioTestCase):
                 bench = importlib.import_module(f"eval.benchmarks.{name}.rollout")
                 grader = importlib.import_module(f"eval.benchmarks.{name}.scoring")
                 args = _args(bench, ["--limit", "1", "--output-dir", str(Path(tmp) / "run")])
-                sample = bench.load_tasks(args)[0]
-                content = (
-                    str(sample["gold"])
-                    if name in ("browsecomp", "webwalkerqa")
-                    else json.dumps({"answer": sample["gold"]})
-                )
+                task = bench.load_tasks(args)[0]
+                content = str(task.gold) if name in ("browsecomp", "webwalkerqa") else json.dumps({"answer": task.gold})
                 if name == "math":
-                    content = rf"\boxed{{{sample['gold']}}}"
-                ctx = model.Context(MagicMock(close=AsyncMock()), PARAMS, asyncio.Semaphore(1))
+                    content = rf"\boxed{{{task.gold}}}"
                 with contextlib.ExitStack() as stack:
-                    rollout_context = stack.enter_context(patch.object(bench, "make_context", return_value=ctx))
+                    rollout_client = stack.enter_context(
+                        patch.object(bench, "make_client", return_value=_mock_client())
+                    )
                     call = stack.enter_context(
                         patch.object(agent, "call_model", return_value=model.AssistantTurn(content))
                     )
                     if name in WEB:
                         stack.enter_context(patch.object(bench, "common_server", return_value=FastMCP("common")))
-                    traces = await bench.run_rollout(args, [sample])
-                rollout_context.assert_called_once()
+                    traces = await bench.rollout(args, [task])
+                rollout_client.assert_called_once()
                 self.assertEqual(call.await_count, 1)
                 self.assertIsNone(traces[0].error)
                 run_dir = Path(args.output_dir)
                 self.assertEqual({p.name for p in run_dir.iterdir()}, {"config.json", "trajectories"})
                 config = json.loads((run_dir / "config.json").read_text())
-                self.assertEqual(config["sample_ids"], [sample["id"]])
+                self.assertEqual(config["sample_ids"], [task.id])
                 before = {str(p): p.read_bytes() for p in run_dir.rglob("*") if p.is_file()}
                 judge_client = MagicMock(close=AsyncMock())
-                judge_ctx = model.Context(judge_client, PARAMS, asyncio.Semaphore(1))
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(
                         patch.object(
                             bench,
-                            "make_context",
+                            "make_client",
                             side_effect=AssertionError("Rollout called during scoring"),
                         )
                     )
                     if name in ("browsecomp", "webwalkerqa"):
-                        build = stack.enter_context(patch.object(grader, "make_context", return_value=judge_ctx))
+                        build = stack.enter_context(patch.object(grader, "make_client", return_value=judge_client))
                         stack.enter_context(patch.object(grader, "load_dotenv"))
-                        stack.enter_context(
+                        judge_call = stack.enter_context(
                             patch.object(grader, "call_model", return_value=model.AssistantTurn("correct: yes"))
                         )
                     if name == "math":
@@ -239,7 +228,8 @@ class PipelineSmokeTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(scored.returncode, 0, scored.stderr)
                     else:
                         stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-                        self.assertEqual(await asyncio.to_thread(grader.main, [str(run_dir)]), 0)
+                        stack.enter_context(patch.object(sys, "argv", ["scoring", name, str(run_dir)]))
+                        self.assertEqual(await asyncio.to_thread(cli.scoring_main), 0)
                 output = next((run_dir / "scores").iterdir())
                 summary = json.loads((output / "summary.json").read_text())
                 self.assertEqual((summary["num_tasks"], summary["correct"], summary["sys_errors"]), (1, 1, 0))
@@ -253,9 +243,20 @@ class PipelineSmokeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("judge_api_key", score_config)
                 if name in ("browsecomp", "webwalkerqa"):
                     build.assert_called_once()
-                    self.assertTrue(build.call_args.args[2].enable_thinking)
-                    self.assertEqual(build.call_args.args[2].reasoning_effort, "medium")
+                    self.assertTrue(judge_call.call_args.kwargs["enable_thinking"])
+                    self.assertEqual(judge_call.call_args.kwargs["reasoning_effort"], "medium")
                     judge_client.close.assert_awaited_once()
+
+
+def _mock_client():
+    client = MagicMock(close=AsyncMock())
+
+    async def close_client(*_args):
+        await client.close()
+
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(side_effect=close_client)
+    return client
 
 
 def _args(bench, flags=()):

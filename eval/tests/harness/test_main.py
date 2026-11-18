@@ -11,13 +11,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from eval import agent
-from eval.agent import Task, Trajectory, run_episode
+from eval.agent import Task, Trajectory, react
 from eval.harness.tool import Connection, ToolBox, ToolResponse
 from eval.harness.utils import load_trajectory, save_trajectory
-from eval.model.openai import AssistantTurn, Context, ModelParams
+from eval.model import AssistantTurn
 
 __all__ = []
-PARAMS = ModelParams("model", 0, 1, 1024, 42)
+PARAMS = {"model": "model", "temperature": 0, "top_p": 1, "max_tokens": 1024, "seed": 42}
 USAGE = {"prompt_tokens": 10, "completion_tokens": 4, "reasoning_tokens": 2}
 SEARCH_SCHEMA = {
     "type": "function",
@@ -39,7 +39,6 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name) / "trajectory.json"
         self.client = MagicMock(close=AsyncMock())
-        self.ctx = Context(self.client, PARAMS, asyncio.Semaphore(1))
         self.task = Task("sample", "system", "question", max_turns=3, meta={"tag": "test"})
         self.connection = MagicMock(spec=Connection, name="common", schemas=[SEARCH_SCHEMA])
         self.connection.name = "common"
@@ -57,11 +56,10 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
                     AsyncMock(return_value=AssistantTurn(content=content, finish_reason=reason)),
                 ),
             ):
-                result = await run_episode(replace(self.task, strict_response=True), self.ctx, ToolBox(), out=self.path)
+                result = await react(replace(self.task, strict_response=True), self.client, ToolBox(), PARAMS)
             self.assertEqual(result.episode_status, "invalid_response")
             self.assertEqual(result.finish_reason, reason)
             self.assertIn("ModelResponseError", result.error or "")
-            self.assertEqual(load_trajectory(self.path), result)
 
     async def test_tool_calls_after_final_turn_are_recorded_without_console_errors(self):
         turn = _reply("", calls=[_tool_call("search", '{"query":"first"}')])
@@ -69,7 +67,7 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
             self.assertNoLogs("eval.harness", level="WARNING"),
             patch.object(agent, "call_model", AsyncMock(side_effect=[turn, turn])),
         ):
-            result = await run_episode(replace(self.task, max_turns=1, strict_response=True), self.ctx, self.tools)
+            result = await react(replace(self.task, max_turns=1, strict_response=True), self.client, self.tools, PARAMS)
         self.assertIn("ModelResponseError", result.error or "")
         self.assertEqual(self.connection.call.await_count, 1)
 
@@ -79,7 +77,8 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("eval.agent", level="ERROR") as logs,
             patch.object(agent, "call_model", AsyncMock(return_value=turn)),
         ):
-            result = await run_episode(self.task, self.ctx, ToolBox(), out=self.path)
+            result = await react(self.task, self.client, ToolBox(), PARAMS)
+        save_trajectory(result, self.path)
         self.assertIn("Endpoint unavailable", "\n".join(logs.output))
         self.assertEqual(result.error, "RuntimeError: Endpoint unavailable")
         self.assertEqual(load_trajectory(self.path), result)
@@ -88,7 +87,8 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         for reason in ("stop", None, "provider_custom_value"):
             turn = AssistantTurn(content="answer", finish_reason=reason)
             with self.subTest(reason=reason), patch.object(agent, "call_model", AsyncMock(return_value=turn)):
-                result = await run_episode(self.task, self.ctx, ToolBox(), out=self.path)
+                result = await react(self.task, self.client, ToolBox(), PARAMS)
+            save_trajectory(result, self.path)
             saved = json.loads(self.path.read_text())
             self.assertNotIn("stop_reason", saved)
             self.assertEqual(saved["episode_status"], "final_answer")
@@ -109,7 +109,8 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_single_turn_qa_uses_the_same_loop_and_persists_all_metadata(self):
         with patch.object(agent, "call_model", new_callable=AsyncMock, return_value=_reply("  answer\n")) as call:
-            result = await run_episode(replace(self.task, max_turns=1), self.ctx, ToolBox(), out=self.path)
+            result = await react(replace(self.task, max_turns=1), self.client, ToolBox(), PARAMS)
+        save_trajectory(result, self.path)
         self.assertEqual((result.final_answer, result.turns, result.episode_status), ("answer", 1, "final_answer"))
         self.assertEqual(result.usage, USAGE)
         self.assertEqual(result.finish_reasons, {"stop": 1})
@@ -128,7 +129,7 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         calls = [_tool_call("search", '{ "query": "capital", "extra": [1, 2] }')]
         with patch.object(agent, "call_model", new_callable=AsyncMock) as call:
             call.side_effect = [_reply("", calls=calls, finish="tool_calls"), _reply("Paris")]
-            result = await run_episode(self.task, self.ctx, self.tools, out=self.path)
+            result = await react(self.task, self.client, self.tools, PARAMS)
         self.assertEqual(result.messages[2]["tool_calls"], calls)
         self.assertEqual(result.messages[3]["tool_result"], raw)
         self.assertEqual(result.messages[3]["tool_name"], "search")
@@ -142,7 +143,7 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent, "call_model", new_callable=AsyncMock) as call:
             search = _reply("", calls=[_tool_call("search", '{"query":"q"}')], finish="tool_calls")
             call.side_effect = [search, search, _reply('{"answer":"Paris"}')]
-            result = await run_episode(replace(self.task, max_turns=2), self.ctx, self.tools, out=self.path)
+            result = await react(replace(self.task, max_turns=2), self.client, self.tools, PARAMS)
         self.assertEqual(call.await_count, 3)
         self.assertEqual(
             [request.args[2] for request in call.await_args_list], [[SEARCH_SCHEMA], [SEARCH_SCHEMA], None]
@@ -153,7 +154,6 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("No steps remain", result.messages[-2]["content"])
         self.assertEqual(result.usage, {key: value * 3 for key, value in USAGE.items()})
         self.assertEqual(result.finish_reasons, {"tool_calls": 2, "stop": 1})
-        self.assertEqual(load_trajectory(self.path), result)
 
     async def test_unknown_answer_call_can_finish_in_the_final_request(self):
         with patch.object(agent, "call_model", new_callable=AsyncMock) as call:
@@ -161,7 +161,7 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
                 _reply("", calls=[_tool_call("answer", '{"answer":"cloak"}')], finish="tool_calls"),
                 _reply('{"answer":"cloak"}'),
             ]
-            result = await run_episode(replace(self.task, max_turns=1), self.ctx, self.tools, out=self.path)
+            result = await react(replace(self.task, max_turns=1), self.client, self.tools, PARAMS)
         self.assertEqual(result.messages[3]["content"], "Unknown tool 'answer'.")
         self.assertEqual((result.final_answer, result.turns, result.error), ('{"answer":"cloak"}', 2, None))
         self.assertIsNone(call.await_args_list[-1].args[2])
@@ -170,14 +170,14 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_reply_consumes_a_turn_and_retries_within_budget(self):
         with patch.object(agent, "call_model", new_callable=AsyncMock) as call:
             call.side_effect = [_reply(""), _reply("answer")]
-            result = await run_episode(self.task, self.ctx, ToolBox(), out=self.path)
+            result = await react(self.task, self.client, ToolBox(), PARAMS)
         self.assertEqual(result.turns, 2)
         self.assertIn("empty", result.messages[3]["content"])
         self.assertEqual(result.final_answer, "answer")
 
     async def test_empty_final_response_stops_after_one_final_request(self):
         with patch.object(agent, "call_model", new_callable=AsyncMock, return_value=_reply("")) as call:
-            result = await run_episode(replace(self.task, max_turns=1), self.ctx, ToolBox(), out=self.path)
+            result = await react(replace(self.task, max_turns=1), self.client, ToolBox(), PARAMS)
         self.assertEqual(call.await_count, 2)
         self.assertEqual(result.turns, 2)
         self.assertEqual(result.episode_status, "max_turns")
@@ -187,7 +187,7 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
     async def test_final_request_never_executes_tool_calls(self):
         search = _reply("", calls=[_tool_call("search", '{"query":"q"}')], finish="tool_calls")
         with patch.object(agent, "call_model", new_callable=AsyncMock, side_effect=[search, search]) as call:
-            result = await run_episode(replace(self.task, max_turns=1), self.ctx, self.tools, out=self.path)
+            result = await react(replace(self.task, max_turns=1), self.client, self.tools, PARAMS)
         self.assertEqual((call.await_count, self.connection.call.await_count), (2, 1))
         self.assertEqual(result.messages[-1]["tool_calls"], search.tool_calls)
         self.assertEqual(result.episode_status, "max_turns")
@@ -197,20 +197,19 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         partial = _reply("partial")
         partial.error = RuntimeError("final request failed")
         with patch.object(agent, "call_model", new_callable=AsyncMock, side_effect=[_reply(""), partial]) as call:
-            result = await run_episode(replace(self.task, max_turns=1), self.ctx, ToolBox(), out=self.path)
+            result = await react(replace(self.task, max_turns=1), self.client, ToolBox(), PARAMS)
         self.assertEqual(call.await_count, 2)
         self.assertEqual(result.error, "RuntimeError: final request failed")
         self.assertEqual(result.episode_status, "error")
         self.assertEqual(result.messages[-1]["content"], "partial")
         self.assertTrue(result.messages[-1]["incomplete"])
         self.assertEqual(result.usage, {key: value * 2 for key, value in USAGE.items()})
-        self.assertEqual(load_trajectory(self.path), result)
 
     async def test_malformed_arguments_are_preserved_and_reported_without_executing(self):
         for arguments in ('{"query":', "[]", "42"):
             with self.subTest(arguments=arguments), patch.object(agent, "call_model", new_callable=AsyncMock) as call:
                 call.side_effect = [_reply("", calls=[_tool_call("search", arguments)]), _reply("answer")]
-                result = await run_episode(self.task, self.ctx, self.tools, out=self.path)
+                result = await react(self.task, self.client, self.tools, PARAMS)
                 self.assertEqual(result.messages[2]["tool_calls"][0]["function"]["arguments"], arguments)
                 self.assertTrue(result.messages[3]["is_error"])
                 self.assertIn("JSON", result.messages[3]["content"])
@@ -220,7 +219,7 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_tool_is_an_observation_and_the_loop_continues(self):
         with patch.object(agent, "call_model", new_callable=AsyncMock) as call:
             call.side_effect = [_reply("", calls=[_tool_call("missing", "{}")]), _reply("answer")]
-            result = await run_episode(self.task, self.ctx, self.tools, out=self.path)
+            result = await react(self.task, self.client, self.tools, PARAMS)
         self.assertEqual(result.messages[3]["content"], "Unknown tool 'missing'.")
         self.assertEqual(result.final_answer, "answer")
         self.connection.call.assert_not_awaited()
@@ -230,7 +229,7 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         calls = [_tool_call("search", '{"query":"first"}', "one"), _tool_call("search", '{"query":"second"}', "two")]
         with patch.object(agent, "call_model", new_callable=AsyncMock) as call:
             call.side_effect = [_reply("", calls=calls), _reply("answer")]
-            result = await run_episode(self.task, self.ctx, self.tools, out=self.path)
+            result = await react(self.task, self.client, self.tools, PARAMS)
         observations = [message for message in result.messages if message["role"] == "tool"]
         self.assertEqual([message["tool_call_id"] for message in observations], ["one", "two"])
         self.assertEqual([message["is_error"] for message in observations], [True, False])
@@ -240,13 +239,12 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         self.connection.call.return_value = ToolResponse("", is_error=True, fatal="HTTP 402: balance")
         with patch.object(agent, "call_model", new_callable=AsyncMock) as call:
             call.return_value = _reply("", calls=[_tool_call("search", '{"query":"q"}')])
-            result = await run_episode(self.task, self.ctx, self.tools, out=self.path)
+            result = await react(self.task, self.client, self.tools, PARAMS)
         call.assert_awaited_once()
         self.assertIn("HTTP 402", result.error or "")
         self.assertEqual(result.episode_status, "error")
         self.assertEqual(result.messages[-1]["content"], "")
         self.assertIn("402", result.messages[-1]["error"])
-        self.assertEqual(load_trajectory(self.path), result)
 
     async def test_environment_interface_failure_is_persisted(self):
 
@@ -258,18 +256,20 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
             async def call_tool(self, name, arguments):
                 raise AssertionError("unreachable")
 
-        result = await run_episode(self.task, self.ctx, BrokenEnvironment(), out=self.path)
+        result = await react(self.task, self.client, BrokenEnvironment(), PARAMS)
         self.assertEqual(result.error, "RuntimeError: discovery failed")
         self.assertEqual(result.turns, 0)
-        self.assertEqual(load_trajectory(self.path), result)
 
-    async def test_task_timeout_includes_waiting_for_the_model_semaphore(self):
-        ctx = replace(self.ctx, semaphore=asyncio.Semaphore(0))
-        result = await run_episode(replace(self.task, timeout=0.01), ctx, ToolBox(), out=self.path)
+    async def test_task_timeout_while_awaiting_model_request(self):
+        async def wait_forever(**_kwargs):
+            await asyncio.Event().wait()
+
+        self.client.chat.completions.create = AsyncMock(side_effect=wait_forever)
+        result = await react(replace(self.task, timeout=0.01), self.client, ToolBox(), PARAMS)
         self.assertEqual(result.episode_status, "timeout")
         self.assertIn("task_timeout", result.error or "")
         self.assertTrue(result.messages[-1]["incomplete"])
-        self.client.chat.completions.create.assert_not_called()
+        self.client.chat.completions.create.assert_awaited_once()
 
     async def test_task_timeout_during_a_tool_call_saves_the_attempt(self):
 
@@ -279,30 +279,26 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         self.connection.call.side_effect = wait_forever
         with patch.object(agent, "call_model", new_callable=AsyncMock) as call:
             call.return_value = _reply("", calls=[_tool_call("search", '{"query":"q"}')])
-            result = await run_episode(replace(self.task, timeout=0.01), self.ctx, self.tools, out=self.path)
+            result = await react(replace(self.task, timeout=0.01), self.client, self.tools, PARAMS)
         self.assertEqual(result.episode_status, "timeout")
         self.assertEqual(result.messages[-1]["role"], "tool")
         self.assertIn("CancelledError", result.messages[-1]["error"])
         self.assertGreaterEqual(result.messages[-1]["latency_sec"], 0.005)
-        self.assertEqual(load_trajectory(self.path), result)
 
     async def test_final_request_is_within_the_episode_timeout(self):
         entered = asyncio.Event()
 
-        async def reply(*args):
+        async def reply(*args, **_kwargs):
             if not entered.is_set():
                 entered.set()
                 return _reply("")
             await asyncio.Event().wait()
 
         with patch.object(agent, "call_model", new_callable=AsyncMock, side_effect=reply) as call:
-            result = await run_episode(
-                replace(self.task, max_turns=1, timeout=0.01), self.ctx, ToolBox(), out=self.path
-            )
+            result = await react(replace(self.task, max_turns=1, timeout=0.01), self.client, ToolBox(), PARAMS)
         self.assertEqual(call.await_count, 2)
         self.assertEqual(result.episode_status, "timeout")
         self.assertIn("task_timeout", result.error or "")
-        self.assertEqual(load_trajectory(self.path), result)
 
     async def test_failed_stream_keeps_partial_content_reasoning_and_usage(self):
         stream = MagicMock(close=AsyncMock())
@@ -318,17 +314,16 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("stream failed")
 
         stream.__aiter__.side_effect = chunks
-        self.ctx.client.chat.completions.create = AsyncMock(return_value=stream)
-        result = await run_episode(self.task, self.ctx, ToolBox(), out=self.path)
+        self.client.chat.completions.create = AsyncMock(return_value=stream)
+        result = await react(self.task, self.client, ToolBox(), PARAMS)
         self.assertEqual(result.error, "RuntimeError: stream failed")
         self.assertEqual(result.messages[-1]["content"], "partial")
         self.assertEqual(result.messages[-1]["reasoning_content"], "reason")
         self.assertTrue(result.messages[-1]["incomplete"])
         self.assertEqual(result.usage, USAGE)
-        self.assertEqual(load_trajectory(self.path), result)
         stream.close.assert_awaited_once()
 
-    async def test_cancellation_propagates_after_saving_partial_stream(self):
+    async def test_cancellation_propagates_without_writing_partial_trajectory(self):
         started = asyncio.Event()
         stream = MagicMock(close=AsyncMock())
 
@@ -338,25 +333,15 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
 
         stream.__aiter__.side_effect = chunks
-        self.ctx.client.chat.completions.create = AsyncMock(return_value=stream)
-        future = asyncio.create_task(run_episode(self.task, self.ctx, ToolBox(), out=self.path))
+        self.client.chat.completions.create = AsyncMock(return_value=stream)
+        future = asyncio.create_task(react(self.task, self.client, ToolBox(), PARAMS))
         await started.wait()
         future.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await future
-        saved = load_trajectory(self.path)
-        self.assertEqual((saved.episode_status, saved.error), ("cancelled", "CancelledError"))
-        self.assertEqual(saved.messages[-1]["content"], "partial")
+        self.assertFalse(self.path.exists())
         stream.close.assert_awaited_once()
         self.client.close.assert_not_awaited()
-
-    async def test_storage_failure_propagates_to_eval(self):
-        with (
-            patch.object(agent, "call_model", new_callable=AsyncMock, return_value=_reply("answer")),
-            patch.object(agent, "save_trajectory", side_effect=OSError("disk full")),
-            self.assertRaisesRegex(OSError, "disk full"),
-        ):
-            await run_episode(self.task, self.ctx, ToolBox(), out=self.path)
 
 
 class SchemaTests(unittest.TestCase):

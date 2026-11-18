@@ -12,14 +12,14 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from ...agent import Trajectory
+from ...agent import Task, Trajectory
 from ...harness.utils import write_json
 from .._common.metrics import ScoreRecord, ScoreResult, make_score_record
 from .._common.resume import finalize_score_dir, init_score_dir, parse_score_args
 from .._common.tasks import run_tasks
 from .rollout import load_tasks
 
-__all__ = ["parse_args", "score", "main"]
+__all__ = ["parse_args", "score", "run_score"]
 
 METHOD = "normalized"
 _logger = logging.getLogger(__name__)
@@ -30,26 +30,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parse_score_args(parser, argv)
 
 
-async def score(
-    sample: dict[str, Any], trace: Trajectory, environment_outputs: dict | None, config: dict
-) -> ScoreResult:
+async def score(task: Task, trace: Trajectory, environment_outputs: dict | None, config: dict) -> ScoreResult:
     prediction = _parse_text_answer(trace.final_answer or "")
-    value = float(_verify_text(prediction, str(sample["gold"])))
-    return ScoreResult(sample["gold"], prediction, value if trace.error is None else 0.0, METHOD)
+    value = float(_verify_text(prediction, str(task.gold)))
+    return ScoreResult(task.gold, prediction, value if trace.error is None else 0.0, METHOD)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    output, summary = asyncio.run(_run_score(parse_args(argv)))
-    print(f"Scores: {output}")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return int(summary["sys_errors"] > 0)
-
-
-async def _run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
+async def run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     started = time.perf_counter()
     (
         output,
-        samples,
+        tasks,
         trajectories,
         environment_outputs,
         rollout_config,
@@ -59,24 +50,23 @@ async def _run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
         prev_wall,
     ) = init_score_dir(args, load_tasks, benchmark="gaia", method=METHOD, group_by=("level",))
     records = list(kept.values())
-    pending = [sample for sample in samples if str(sample["id"]) not in kept]
+    pending = [task for task in tasks if task.id not in kept]
 
-    async def score_sample(sample: dict[str, Any]) -> ScoreRecord:
-        task_id = str(sample["id"])
-        trace = trajectories[task_id]
-        result = ScoreResult(sample["gold"], trace.final_answer, 0.0, METHOD)
+    async def score_task(task: Task) -> ScoreRecord:
+        trace = trajectories[task.id]
+        result = ScoreResult(task.gold, trace.final_answer, 0.0, METHOD)
         scoring_sec = 0.0
         if trace.error is None:
             scoring_started = time.perf_counter()
             try:
-                result = await score(sample, trace, environment_outputs[task_id], rollout_config)
+                result = await score(task, trace, environment_outputs[task.id], rollout_config)
             except Exception as exc:
                 result.sys_error = f"{type(exc).__name__}: {exc}"
             finally:
                 scoring_sec = round(time.perf_counter() - scoring_started, 6)
             if result.sys_error is not None:
-                _logger.error("Scoring %s failed: %s", task_id, result.sys_error)
-        return make_score_record(sample, trace, result, scoring_sec)
+                _logger.error("Scoring %s failed: %s", task.id, result.sys_error)
+        return make_score_record(task, trace, result, scoring_sec)
 
     def persist(record: ScoreRecord) -> None:
         records.append(record)
@@ -87,7 +77,7 @@ async def _run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     try:
         if pending:
             new_ordered = await run_tasks(
-                pending, score_sample, concurrency=args.sample_concurrency, desc="score gaia", on_result=persist
+                pending, score_task, concurrency=args.concurrency, desc="score gaia", on_result=persist
             )
         completed = True
     finally:
@@ -95,7 +85,7 @@ async def _run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
         if completed:
             by_id = dict(kept)
             by_id.update({r.task_id: r for r in new_ordered})
-            ordered = [by_id[str(s["id"])] for s in samples]
+            ordered = [by_id[task.id] for task in tasks]
         summary = finalize_score_dir(
             output,
             score_config,
@@ -188,4 +178,6 @@ def _last_json_object(text: str) -> dict[str, Any] | None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    output, summary = asyncio.run(run_score(parse_args()))
+    print(f"Scores: {output}")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))

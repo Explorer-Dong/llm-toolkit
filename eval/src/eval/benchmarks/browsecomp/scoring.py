@@ -7,23 +7,24 @@ import logging
 import os
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 from ... import ROOT
-from ...agent import Trajectory
+from ...agent import Task, Trajectory
 from ...harness.utils import clean_text, write_json
-from ...model import Context, ModelParams, call_model, make_context
+from ...model import call_model, make_client
 from .._common.metrics import ScoreRecord, ScoreResult, make_score_record
 from .._common.resume import finalize_score_dir, init_score_dir, parse_score_args
 from .._common.tasks import run_tasks
 from .rollout import load_tasks
 
-__all__ = ["parse_args", "score", "main"]
+__all__ = ["parse_args", "score", "run_score"]
 
 METHOD = "judge"
 _logger = logging.getLogger(__name__)
@@ -53,7 +54,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-api-key", default=os.getenv("JUDGE_API_KEY", "EMPTY"))
     parser.add_argument("--judge-max-tokens", type=int, default=4096)
     parser.add_argument("--timeout", type=float, default=900)
-    parser.add_argument("--concurrency", type=int, default=4, help="maximum concurrent judge requests")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--enable-thinking",
@@ -64,24 +64,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--reasoning-effort", default="medium", metavar="LEVEL", help="reasoning effort (default: medium)"
     )
-    args = parse_score_args(parser, argv)
+    args = parse_score_args(parser, argv, concurrency=4)
     if not args.judge_model or args.judge_max_tokens < 1 or args.timeout <= 0:
         parser.error("judge model, positive token budget and timeout are required")
     return args
 
 
 async def score(
-    sample: dict[str, Any], trace: Trajectory, environment_outputs: dict | None, config: dict, *, ctx: Context
+    task: Task,
+    trace: Trajectory,
+    environment_outputs: dict | None,
+    config: dict,
+    *,
+    client: AsyncOpenAI,
+    model_params: Mapping[str, Any],
 ) -> ScoreResult:
-    score_result = ScoreResult(sample["gold"], trace.final_answer, 0.0, METHOD)
+    score_result = ScoreResult(task.gold, trace.final_answer, 0.0, METHOD)
     if trace.error is not None or trace.final_answer is None:
         return score_result
-    prompt = JUDGE_PROMPT.format(
-        question=sample["question"], response=trace.final_answer, correct_answer=sample["gold"]
-    )
+    prompt = JUDGE_PROMPT.format(question=task.prompt, response=trace.final_answer, correct_answer=task.gold)
     score_result.messages.append({"role": "user", "content": prompt})
     try:
-        turn = await call_model(ctx, score_result.messages)
+        turn = await call_model(client, score_result.messages, **model_params)
         score_result.messages.append(turn.message())
         if turn.error is not None:
             raise turn.error
@@ -101,18 +105,11 @@ async def score(
     return score_result
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    output, summary = asyncio.run(_run_score(parse_args(argv)))
-    print(f"Scores: {output}")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return int(summary["sys_errors"] > 0)
-
-
-async def _run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
+async def run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     started = time.perf_counter()
     (
         output,
-        samples,
+        tasks,
         trajectories,
         environment_outputs,
         rollout_config,
@@ -129,42 +126,43 @@ async def _run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
         metadata={"judge_prompt": JUDGE_PROMPT},
     )
     records = list(kept.values())
-    pending = [sample for sample in samples if str(sample["id"]) not in kept]
-    ctx = None
+    pending = [task for task in tasks if task.id not in kept]
+    client = None
+    model_params = {
+        "model": args.judge_model,
+        "temperature": 0,
+        "top_p": 1,
+        "max_tokens": args.judge_max_tokens,
+        "seed": args.seed,
+        "enable_thinking": args.enable_thinking,
+        "reasoning_effort": args.reasoning_effort,
+    }
 
-    async def score_sample(sample: dict[str, Any]) -> ScoreRecord:
-        nonlocal ctx
-        task_id = str(sample["id"])
-        trace = trajectories[task_id]
-        result = ScoreResult(sample["gold"], trace.final_answer, 0.0, METHOD)
+    async def score_task(task: Task) -> ScoreRecord:
+        nonlocal client
+        trace = trajectories[task.id]
+        result = ScoreResult(task.gold, trace.final_answer, 0.0, METHOD)
         scoring_sec = 0.0
         if trace.error is None:
-            if ctx is None:
-                ctx = make_context(
-                    args.judge_base_url,
-                    args.judge_api_key,
-                    ModelParams(
-                        args.judge_model,
-                        0,
-                        1,
-                        args.judge_max_tokens,
-                        args.seed,
-                        enable_thinking=args.enable_thinking,
-                        reasoning_effort=args.reasoning_effort,
-                    ),
-                    args.concurrency,
-                    timeout=args.timeout,
-                )
+            if client is None:
+                client = make_client(args.judge_base_url, args.judge_api_key, timeout=args.timeout)
             scoring_started = time.perf_counter()
             try:
-                result = await score(sample, trace, environment_outputs[task_id], rollout_config, ctx=ctx)
+                result = await score(
+                    task,
+                    trace,
+                    environment_outputs[task.id],
+                    rollout_config,
+                    client=client,
+                    model_params=model_params,
+                )
             except Exception as exc:
                 result.sys_error = f"{type(exc).__name__}: {exc}"
             finally:
                 scoring_sec = round(time.perf_counter() - scoring_started, 6)
             if result.sys_error is not None:
-                _logger.error("Scoring %s failed: %s", task_id, result.sys_error)
-        return make_score_record(sample, trace, result, scoring_sec)
+                _logger.error("Scoring %s failed: %s", task.id, result.sys_error)
+        return make_score_record(task, trace, result, scoring_sec)
 
     def persist(record: ScoreRecord) -> None:
         records.append(record)
@@ -175,19 +173,19 @@ async def _run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     try:
         if pending:
             new_ordered = await run_tasks(
-                pending, score_sample, concurrency=args.sample_concurrency, desc="score browsecomp", on_result=persist
+                pending, score_task, concurrency=args.concurrency, desc="score browsecomp", on_result=persist
             )
         completed = True
     finally:
         try:
-            if ctx is not None:
-                await ctx.client.close()
+            if client is not None:
+                await client.close()
         finally:
             ordered = None
             if completed:
                 by_id = dict(kept)
                 by_id.update({r.task_id: r for r in new_ordered})
-                ordered = [by_id[str(s["id"])] for s in samples]
+                ordered = [by_id[task.id] for task in tasks]
             summary = finalize_score_dir(
                 output,
                 score_config,
@@ -205,4 +203,6 @@ async def _run_score(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    output, summary = asyncio.run(run_score(parse_args()))
+    print(f"Scores: {output}")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))

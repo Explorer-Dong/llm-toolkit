@@ -94,8 +94,6 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
         str(args.task_timeout),
         "--concurrency",
         "1",
-        "--sample-concurrency",
-        "1",
         "--output-dir",
         str(output / benchmark),
         "--reasoning-effort",
@@ -110,8 +108,6 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
             [
                 "--subset",
                 "easy",
-                "--sample-concurrency",
-                "2",
                 "--concurrency",
                 "2",
                 "--max-turns",
@@ -158,11 +154,11 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
         "-m",
         f"eval.benchmarks.{benchmark}.scoring",
         str(run_dir),
-        "--sample-concurrency",
+        "--concurrency",
         "2" if benchmark == "swe_bench" else "1",
     ]
     if benchmark in JUDGE_BENCHMARKS:
-        score_command.extend(["--timeout", str(args.timeout), "--concurrency", "1"])
+        score_command.extend(["--timeout", str(args.timeout)])
         score_command.extend(["--reasoning-effort", args.reasoning_effort])
         if not args.enable_thinking:
             score_command.append("--no-enable-thinking")

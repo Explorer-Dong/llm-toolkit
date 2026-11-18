@@ -7,24 +7,25 @@ import logging
 import os
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from statistics import mean
 from typing import Any
 
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 from ... import ROOT
-from ...agent import Trajectory
+from ...agent import Task, Trajectory
 from ...harness.utils import write_json
-from ...model import Context, ModelParams, call_model, make_context
+from ...model import call_model, make_client
 from .._common.metrics import ScoreRecord, ScoreResult, make_score_record
 from .._common.resume import finalize_score_dir, init_score_dir, parse_score_args
 from .._common.tasks import run_tasks
 from .rollout import GROUPS, _abstention_type, load_tasks
 
-__all__ = ["parse_args", "score", "summarize", "main"]
+__all__ = ["parse_args", "score", "summarize", "run_score"]
 METHOD = "purchase_gate_and_judge"
 _logger = logging.getLogger(__name__)
 
@@ -67,7 +68,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-max-tokens", type=int, default=8192)
     parser.add_argument("--judge-retries", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=180)
-    parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--seed", type=int, help="optional sampling seed")
     parser.add_argument(
         "--enable-thinking",
@@ -78,22 +78,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--reasoning-effort", default="medium", metavar="LEVEL", help="reasoning effort (default: medium)"
     )
-    args = parse_score_args(parser, argv, sample_concurrency=4)
+    args = parse_score_args(parser, argv, concurrency=4)
     if not args.judge_model or min(args.judge_max_tokens, args.judge_retries) < 1 or args.timeout <= 0:
         parser.error("judge model, positive token budget, retries and timeout are required")
     return args
 
 
 async def score(
-    sample: dict,
+    task: Task,
     trace: Trajectory,
     environment_outputs: dict | None,
     config: dict,
     *,
-    ctx: Context,
+    client: AsyncOpenAI,
+    model_params: Mapping[str, Any],
     retries: int = 3,
 ) -> ScoreResult:
-    result = ScoreResult(sample["gold"], None, 0.0, METHOD)
+    result = ScoreResult(task.gold, None, 0.0, METHOD)
     try:
         if trace.error is not None:
             raise ValueError(f"Agent error: {trace.error}")
@@ -106,7 +107,7 @@ async def score(
             raise ValueError("final_content differs from the final assistant message")
         if not (trace.final_answer or "").strip():
             return result
-        if sample["gold"] == "correct_buy":
+        if task.gold == "correct_buy":
             if not _purchased_correctly(trace.messages):
                 return result
         elif _buy_calls(trace.messages):
@@ -114,19 +115,19 @@ async def score(
         messages = [
             {
                 "role": "system",
-                "content": ABSTAIN_PROMPT if sample["record"]["should_abstain_expected"] else ACT_PROMPT,
+                "content": ABSTAIN_PROMPT if task.raw["should_abstain_expected"] else ACT_PROMPT,
             },
             {
                 "role": "user",
                 "content": json.dumps(
-                    {"instruction": sample["record"]["instruction"], "final_output": trace.final_answer},
+                    {"instruction": task.raw["instruction"], "final_output": trace.final_answer},
                     ensure_ascii=False,
                 ),
             },
         ]
         for attempt in range(retries):
             result.messages.extend(messages)
-            turn = await call_model(ctx, messages)
+            turn = await call_model(client, messages, **model_params)
             result.messages.append(turn.message())
             try:
                 if turn.error is not None:
@@ -134,7 +135,7 @@ async def score(
                 if turn.finish_reason != "stop":
                     raise ValueError(f"Incomplete judge response: {turn.finish_reason}")
                 result.extracted_prediction, correct = _parse_verdict(turn.content)
-                result.score = float(correct and result.extracted_prediction == sample["gold"])
+                result.score = float(correct and result.extracted_prediction == task.gold)
                 return result
             except Exception:
                 if attempt + 1 == retries:
@@ -181,18 +182,11 @@ def summarize(records: list[ScoreRecord]) -> dict:
     return {"by_type": by_type, "macro_mean": macro, "micro_mean": micro}
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    output, summary = asyncio.run(_run_score(parse_args(argv)))
-    print(f"Scores: {output}")
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return int(summary["sys_errors"] > 0)
-
-
-async def _run_score(args: argparse.Namespace) -> tuple[Path, dict]:
+async def run_score(args: argparse.Namespace) -> tuple[Path, dict]:
     started = time.perf_counter()
     (
         output,
-        samples,
+        tasks,
         trajectories,
         environment_outputs,
         rollout_config,
@@ -209,46 +203,50 @@ async def _run_score(args: argparse.Namespace) -> tuple[Path, dict]:
         metadata={"act_prompt": ACT_PROMPT, "abstain_prompt": ABSTAIN_PROMPT},
     )
     records = list(kept.values())
-    pending = [sample for sample in samples if str(sample["id"]) not in kept]
-    ctx = None
+    pending = [task for task in tasks if task.id not in kept]
+    client = None
+    model_params = {
+        "model": args.judge_model,
+        "temperature": 0,
+        "top_p": None,
+        "max_tokens": args.judge_max_tokens,
+        "seed": args.seed,
+        "enable_thinking": None,
+        "extra_body": {"thinking": {"type": "enabled" if args.enable_thinking else "disabled"}},
+        "reasoning_effort": args.reasoning_effort if args.enable_thinking else None,
+    }
 
-    async def score_sample(sample: dict) -> ScoreRecord:
-        nonlocal ctx
-        task_id = str(sample["id"])
-        trace = trajectories[task_id]
-        result = ScoreResult(sample["gold"], trace.final_answer, 0.0, METHOD)
+    async def score_task(task: Task) -> ScoreRecord:
+        nonlocal client
+        trace = trajectories[task.id]
+        result = ScoreResult(task.gold, trace.final_answer, 0.0, METHOD)
         scoring_sec = 0.0
         if trace.error is None:
-            if ctx is None:
-                ctx = make_context(
+            if client is None:
+                client = make_client(
                     args.judge_base_url,
                     args.judge_api_key,
-                    ModelParams(
-                        args.judge_model,
-                        0,
-                        None,
-                        args.judge_max_tokens,
-                        args.seed,
-                        enable_thinking=None,
-                        extra_body={"thinking": {"type": "enabled" if args.enable_thinking else "disabled"}},
-                        reasoning_effort=args.reasoning_effort if args.enable_thinking else None,
-                    ),
-                    args.concurrency,
                     timeout=args.timeout,
                     max_retries=0,
                 )
             scoring_started = time.perf_counter()
             try:
                 result = await score(
-                    sample, trace, environment_outputs[task_id], rollout_config, ctx=ctx, retries=args.judge_retries
+                    task,
+                    trace,
+                    environment_outputs[task.id],
+                    rollout_config,
+                    client=client,
+                    model_params=model_params,
+                    retries=args.judge_retries,
                 )
             except Exception as exc:
                 result.sys_error = f"{type(exc).__name__}: {exc}"
             finally:
                 scoring_sec = round(time.perf_counter() - scoring_started, 6)
             if result.sys_error is not None:
-                _logger.error("Scoring %s failed: %s", task_id, result.sys_error)
-        return make_score_record(sample, trace, result, scoring_sec)
+                _logger.error("Scoring %s failed: %s", task.id, result.sys_error)
+        return make_score_record(task, trace, result, scoring_sec)
 
     def persist(record: ScoreRecord) -> None:
         records.append(record)
@@ -260,22 +258,22 @@ async def _run_score(args: argparse.Namespace) -> tuple[Path, dict]:
         if pending:
             new_ordered = await run_tasks(
                 pending,
-                score_sample,
-                concurrency=args.sample_concurrency,
+                score_task,
+                concurrency=args.concurrency,
                 desc="score webshop_abstain",
                 on_result=persist,
             )
         completed = True
     finally:
         try:
-            if ctx is not None:
-                await ctx.client.close()
+            if client is not None:
+                await client.close()
         finally:
             ordered = None
             if completed:
                 by_id = dict(kept)
                 by_id.update({r.task_id: r for r in new_ordered})
-                ordered = [by_id[str(s["id"])] for s in samples]
+                ordered = [by_id[task.id] for task in tasks]
             summary = finalize_score_dir(
                 output,
                 score_config,
@@ -371,4 +369,6 @@ def _pair_scores(pairs: list[tuple[bool, bool]]) -> dict:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    output, summary = asyncio.run(run_score(parse_args()))
+    print(f"Scores: {output}")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))

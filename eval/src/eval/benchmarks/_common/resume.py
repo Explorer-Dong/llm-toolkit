@@ -18,7 +18,7 @@ from .metrics import ScoreRecord, build_summary, load_score_record
 from .storage import (
     PACKAGE_DIR,
     create_directory,
-    load_completed_sample,
+    load_completed_task,
     load_rollout_artifacts,
     resolve_dataset_file,
 )
@@ -27,7 +27,7 @@ __all__ = [
     "SECRET_KEYS",
     "parse_rollout_args",
     "parse_score_args",
-    "filter_pending_samples",
+    "filter_pending_tasks",
     "restore_resume_args",
     "validate_resume_config",
     "init_rollout_dir",
@@ -43,7 +43,6 @@ ROLLOUT_OVERRIDABLE = frozenset(
         "api_key",
         "timeout",
         "concurrency",
-        "sample_concurrency",
         "max_retries",
         "request_attempts",
         "retry_delay",
@@ -59,6 +58,7 @@ ROLLOUT_IGNORED = frozenset(
     {
         "resume",
         "output_dir",
+        "sample_concurrency",
         "sample_ids",
         "collect_environment_outputs",
         "wall_time_sec",
@@ -70,7 +70,6 @@ SCORING_OVERRIDABLE = frozenset(
         "judge_api_key",
         "timeout",
         "concurrency",
-        "sample_concurrency",
         "judge_retries",
     }
 )
@@ -78,6 +77,7 @@ SCORING_IGNORED = frozenset(
     {
         "resume",
         "output_dir",
+        "sample_concurrency",
         "run_dir",
         "source_run_dir",
         "scoring_method",
@@ -120,13 +120,12 @@ def parse_rollout_args(parser: argparse.ArgumentParser, argv: Sequence[str] | No
         args.resume = resume_dir
     if not args.model:
         parser.error("--model or MODEL_NAME is required")
-    if args.concurrency < 1 or (args.sample_concurrency is not None and args.sample_concurrency < 1):
-        parser.error("concurrency limits must be positive")
+    if args.concurrency < 1:
+        parser.error("concurrency must be positive")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be positive")
     if args.max_turns < 1 or args.task_timeout < 0:
         parser.error("max_turns must be positive and task_timeout must be nonnegative")
-    args.sample_concurrency = args.sample_concurrency or args.concurrency
     return args
 
 
@@ -134,12 +133,12 @@ def parse_score_args(
     parser: argparse.ArgumentParser,
     argv: Sequence[str] | None = None,
     *,
-    sample_concurrency: int = 1,
+    concurrency: int = 1,
 ) -> argparse.Namespace:
     parser.add_argument("run_dir", type=Path, nargs="?")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--resume", type=Path, help="existing score directory to resume")
-    parser.add_argument("--sample-concurrency", type=int, default=sample_concurrency)
+    parser.add_argument("--concurrency", type=int, default=concurrency, help="maximum concurrent tasks")
     args = parser.parse_args(argv)
     if args.resume is not None:
         if args.output_dir is not None:
@@ -167,24 +166,18 @@ def parse_score_args(
         args.resume = resume_dir
     elif args.run_dir is None:
         parser.error("run_dir is required unless --resume is specified")
-    if args.sample_concurrency < 1 or getattr(args, "concurrency", 1) < 1:
-        parser.error("concurrency limits must be positive")
+    if args.concurrency < 1:
+        parser.error("concurrency must be positive")
     return args
 
 
-def filter_pending_samples(
-    args: argparse.Namespace, samples: list[dict[str, Any]], *, collect_enabled: bool = False
-) -> list[dict[str, Any]]:
-    """Return samples that do not yet have a completed output in the resumed run directory."""
+def filter_pending_tasks(args: argparse.Namespace, tasks: list[Task], *, collect_enabled: bool = False) -> list[Task]:
+    """Return tasks that do not yet have a completed output in the resumed run directory."""
     resume_dir = getattr(args, "resume", None)
     if resume_dir is None:
-        return samples
+        return tasks
     run_dir = Path(resume_dir).resolve()
-    return [
-        sample
-        for sample in samples
-        if load_completed_sample(run_dir, str(sample["id"]), collect_enabled=collect_enabled) is None
-    ]
+    return [task for task in tasks if load_completed_task(run_dir, task.id, collect_enabled=collect_enabled) is None]
 
 
 def restore_resume_args(
@@ -196,7 +189,7 @@ def restore_resume_args(
     package_dir: Path,
     overridable: AbstractSet[str],
     ignored: AbstractSet[str],
-) -> None:
+) -> dict[str, Any]:
     """Restore saved run parameters onto args while rejecting non-system overrides."""
     explicit = _explicit_cli_args(parser, argv)
     path_dests = {action.dest for action in parser._actions if action.type is Path}
@@ -220,6 +213,7 @@ def restore_resume_args(
             setattr(args, key, Path(saved_value))
         else:
             setattr(args, key, saved_value)
+    return explicit
 
 
 def validate_resume_config(
@@ -243,22 +237,18 @@ def validate_resume_config(
 
 def init_rollout_dir(
     args: argparse.Namespace,
-    samples: list[dict[str, Any]],
     tasks: list[Task],
     *,
     collect_enabled: bool = False,
-) -> tuple[Path, dict[str, Any], dict[str, Any] | None, dict[str, Trajectory], list[tuple[dict[str, Any], Task]]]:
-    if args.concurrency < 1 or args.sample_concurrency < 1:
-        raise ValueError("Concurrency limits must be positive")
+) -> tuple[Path, dict[str, Any], dict[str, Any] | None, dict[str, Trajectory], list[Task]]:
+    if args.concurrency < 1:
+        raise ValueError("Concurrency must be positive")
     resume_dir = getattr(args, "resume", None)
     if resume_dir is not None and getattr(args, "output_dir", None) is not None:
         raise ValueError("Cannot combine --resume with --output-dir")
-    pairs = list(zip(samples, tasks, strict=True))
-    if any(task.id != str(sample["id"]) for sample, task in pairs):
-        raise ValueError("Task id must match its sample id")
-    ids = [str(sample["id"]) for sample in samples]
+    ids = [task.id for task in tasks]
     if len(set(ids)) != len(ids):
-        raise ValueError("Sample ids must be unique")
+        raise ValueError("Task ids must be unique")
     for task_id in ids:
         encode_id(task_id)
     data_file = Path(args.dataset_file).resolve()
@@ -310,19 +300,19 @@ def init_rollout_dir(
         collect_environment_outputs=collect_enabled,
     )
     completed: dict[str, Trajectory] = {}
-    pending_pairs: list[tuple[dict[str, Any], Task]] = []
+    pending: list[Task] = []
     if resume_dir is not None:
-        for sample, task in pairs:
-            existing_trace = load_completed_sample(run_dir, task.id, collect_enabled=collect_enabled)
+        for task in tasks:
+            existing_trace = load_completed_task(run_dir, task.id, collect_enabled=collect_enabled)
             if existing_trace is not None:
                 completed[task.id] = existing_trace
             else:
-                pending_pairs.append((sample, task))
-        print(f"Resuming {run_dir}: skipping {len(completed)} completed, running {len(pending_pairs)} remaining")
+                pending.append(task)
+        print(f"Resuming {run_dir}: skipping {len(completed)} completed, running {len(pending)} remaining")
     else:
-        pending_pairs = pairs
+        pending = list(tasks)
     write_json(run_dir / "config.json", config)
-    return run_dir, config, saved_config, completed, pending_pairs
+    return run_dir, config, saved_config, completed, pending
 
 
 def finalize_rollout_dir(
@@ -350,7 +340,7 @@ def finalize_rollout_dir(
 
 def init_score_dir(
     args: argparse.Namespace,
-    load_tasks: Callable[[argparse.Namespace], list[dict[str, Any]]],
+    load_tasks: Callable[[argparse.Namespace], list[Task]],
     *,
     benchmark: str,
     method: str,
@@ -358,7 +348,7 @@ def init_score_dir(
     metadata: dict[str, Any] | None = None,
 ) -> tuple[
     Path,
-    list[dict[str, Any]],
+    list[Task],
     dict[str, Trajectory],
     dict[str, dict | None],
     dict[str, Any],
@@ -401,15 +391,15 @@ def init_score_dir(
     rollout_config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
     if rollout_config["benchmark"] != benchmark:
         raise ValueError(f"Expected a {benchmark!r} run, got {rollout_config['benchmark']!r}")
-    if args.sample_concurrency < 1:
+    if args.concurrency < 1:
         raise ValueError("Concurrency must be positive")
     data_file = resolve_dataset_file(rollout_config["dataset_file"], PACKAGE_DIR)
-    samples = load_tasks(argparse.Namespace(**(rollout_config | {"dataset_file": str(data_file)})))
-    ids = [str(sample["id"]) for sample in samples]
+    tasks = load_tasks(argparse.Namespace(**(rollout_config | {"dataset_file": str(data_file)})))
+    ids = [task.id for task in tasks]
     if len(set(ids)) != len(ids):
-        raise ValueError("Sample ids must be unique")
+        raise ValueError("Task ids must be unique")
     if ids != rollout_config["sample_ids"]:
-        raise ValueError("Dataset selection does not match the rollout sample ids")
+        raise ValueError("Dataset selection does not match the rollout task ids")
     trajectories, environment_outputs = load_rollout_artifacts(run_dir, ids, rollout_config)
 
     if resume_output is not None:
@@ -445,7 +435,7 @@ def init_score_dir(
                     and record.agent_error == trajectories[record.task_id].error
                 ):
                     kept[record.task_id] = record
-        pending_count = sum(1 for sample in samples if str(sample["id"]) not in kept)
+        pending_count = sum(1 for task in tasks if task.id not in kept)
         print(f"Resuming scoring in {output}: skipping {len(kept)} completed, running {pending_count} remaining")
 
     prev_wall: float | None = None
@@ -470,7 +460,7 @@ def init_score_dir(
     write_json(output / "trajectories.json", [asdict(r) for r in kept.values()])
     return (
         output,
-        samples,
+        tasks,
         trajectories,
         environment_outputs,
         rollout_config,

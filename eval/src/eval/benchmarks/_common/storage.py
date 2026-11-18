@@ -13,9 +13,10 @@ __all__ = [
     "trajectory_path",
     "create_directory",
     "resolve_dataset_file",
-    "load_completed_sample",
+    "load_completed_task",
     "prepare_environment_dir",
     "save_environment_result",
+    "cleanup_cancelled_task",
     "load_rollout_artifacts",
 ]
 
@@ -47,7 +48,7 @@ def resolve_dataset_file(value: str | Path, package_dir: Path = PACKAGE_DIR) -> 
     return path.resolve()
 
 
-def load_completed_sample(run_dir: Path, task_id: str, *, collect_enabled: bool = False) -> Trajectory | None:
+def load_completed_task(run_dir: Path, task_id: str, *, collect_enabled: bool = False) -> Trajectory | None:
     path = trajectory_path(run_dir, task_id)
     if not path.is_file():
         return None
@@ -107,6 +108,16 @@ def save_environment_result(directory: Path, task_id: str, data: dict | None, er
     write_json(
         directory / "environment_result.json", {"task_id": task_id, "data": data, "files": files, "error": error}
     )
+
+
+def cleanup_cancelled_task(run_dir: Path, task_id: str) -> None:
+    """Remove persisted outputs for a cancelled task so resume runs it again."""
+    trajectory_path(run_dir, task_id).unlink(missing_ok=True)
+    environment_dir = run_dir / "environment_outputs" / encode_id(task_id)
+    if environment_dir.is_symlink():
+        environment_dir.unlink()
+    elif environment_dir.exists():
+        shutil.rmtree(environment_dir)
 
 
 def load_rollout_artifacts(

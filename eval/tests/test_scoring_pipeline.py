@@ -2,7 +2,6 @@
 
 import argparse
 import ast
-import asyncio
 import contextlib
 import importlib
 import io
@@ -15,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from eval.agent import Trajectory
+from eval.agent import Task, Trajectory
 from eval.benchmarks._common import resume
 from eval.benchmarks._common.metrics import ScoreRecord, ScoreResult, build_summary, collect_costs
 from eval.benchmarks._common.storage import save_environment_result, trajectory_path
@@ -23,7 +22,7 @@ from eval.benchmarks.aime import scoring as aime
 from eval.benchmarks.browsecomp import scoring as browsecomp
 from eval.benchmarks.gpqa import scoring as gpqa
 from eval.harness.utils import save_trajectory
-from eval.model import AssistantTurn, Context, ModelParams
+from eval.model import AssistantTurn
 
 __all__ = []
 REPO = Path(__file__).resolve().parents[2]
@@ -80,7 +79,7 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
             patch.object(gpqa, "score", evaluate),
             self.assertRaisesRegex(ValueError, "Expected a"),
         ):
-            await gpqa._run_score(_score_args(self.run_dir))
+            await gpqa.run_score(_score_args(self.run_dir))
         evaluate.assert_not_awaited()
         self.assertFalse((self.run_dir / "scores").exists())
 
@@ -89,10 +88,10 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
         trajectory_path(self.run_dir, "1").unlink()
         with (
             patch.object(browsecomp, "load_tasks", side_effect=_load_tasks),
-            patch.object(browsecomp, "make_context") as build,
+            patch.object(browsecomp, "make_client") as build,
             self.assertRaisesRegex(ValueError, "Missing trajectory"),
         ):
-            await browsecomp._run_score(_score_args(self.run_dir))
+            await browsecomp.run_score(_score_args(self.run_dir))
         build.assert_not_called()
         self.assertFalse((self.run_dir / "scores").exists())
 
@@ -119,7 +118,7 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
             patch.object(aime, "load_tasks", side_effect=lambda args: _load_tasks(args) * 2),
             self.assertRaisesRegex(ValueError, "unique"),
         ):
-            await aime._run_score(_score_args(self.run_dir))
+            await aime.run_score(_score_args(self.run_dir))
         save_trajectory(Trajectory("extra"), trajectory_path(self.run_dir, "extra"))
         with self.assertRaisesRegex(ValueError, "saved sample ids"):
             await _run_score(_score_args(self.run_dir))
@@ -135,16 +134,15 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
         _write_run(self.run_dir, benchmark="browsecomp")
         original = _rollout_bytes(self.run_dir)
         client = MagicMock(close=AsyncMock())
-        ctx = Context(client, ModelParams("judge", 0, 1, 1024, 42), asyncio.Semaphore(1))
         with (
             patch.object(browsecomp, "load_tasks", side_effect=_load_tasks),
-            patch.object(browsecomp, "make_context", return_value=ctx),
+            patch.object(browsecomp, "make_client", return_value=client),
             patch.object(
                 browsecomp, "call_model", new_callable=AsyncMock, side_effect=RuntimeError("judge unavailable")
             ),
             self.assertLogs("eval.benchmarks.browsecomp.scoring", level="ERROR") as logs,
         ):
-            output, summary = await browsecomp._run_score(_score_args(self.run_dir))
+            output, summary = await browsecomp.run_score(_score_args(self.run_dir))
         record = json.loads((output / "trajectories.json").read_text())[0]
         self.assertIsNone(record["agent_error"])
         self.assertEqual(record["score_result"]["sys_error"], "RuntimeError: judge unavailable")
@@ -184,12 +182,14 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
             await _run_score(_score_args(self.run_dir))
 
     async def test_hybrid_policy_combines_rule_and_judge_in_one_scoring_stage(self):
-        ctx = Context(MagicMock(), ModelParams("judge", 0, 1, 1024, 42), asyncio.Semaphore(1))
+        model_params = {"model": "judge", "temperature": 0, "top_p": 1, "max_tokens": 1024, "seed": 42}
         orig_aime_score = aime.score
 
-        async def hybrid(sample, trace, environment_outputs, config):
-            rule = await orig_aime_score(sample, trace, environment_outputs, config)
-            judged = await browsecomp.score(sample, trace, environment_outputs, config, ctx=ctx)
+        async def hybrid(task, trace, environment_outputs, config):
+            rule = await orig_aime_score(task, trace, environment_outputs, config)
+            judged = await browsecomp.score(
+                task, trace, environment_outputs, config, client=MagicMock(), model_params=model_params
+            )
             judged.method = "hybrid"
             judged.score = 0.4 * rule.score + 0.6 * judged.score
             return judged
@@ -202,12 +202,12 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_resume_scoring_skips_succeeded_and_retries_errors_and_missing(self):
         dataset = self.run_dir.parent / "dataset.json"
-        samples = [
+        rows = [
             {"id": "1", "question": "Q1", "gold": 1, "meta": {}},
             {"id": "2", "question": "Q2", "gold": 2, "meta": {}},
             {"id": "3", "question": "Q3", "gold": 3, "meta": {}},
         ]
-        dataset.write_text(json.dumps(samples))
+        dataset.write_text(json.dumps(rows))
         (self.run_dir / "config.json").write_text(
             json.dumps(
                 {
@@ -219,36 +219,36 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
                 }
             )
         )
-        for sample in samples:
-            sample_id = str(sample["id"])
+        for row in rows:
+            task_id = str(row["id"])
             save_trajectory(
-                Trajectory(sample_id, final_answer=json.dumps({"answer": sample["gold"]})),
-                trajectory_path(self.run_dir, sample_id),
+                Trajectory(task_id, final_answer=json.dumps({"answer": row["gold"]})),
+                trajectory_path(self.run_dir, task_id),
             )
         shutil.rmtree(self.run_dir / "environment_outputs", ignore_errors=True)
 
         seen_first = []
 
-        async def first_eval(sample, trace, env_out, config):
-            seen_first.append(sample["id"])
-            if sample["id"] == "2":
+        async def first_eval(task, trace, env_out, config):
+            seen_first.append(task.id)
+            if task.id == "2":
                 raise RuntimeError("transient judge failure")
-            return ScoreResult(sample["gold"], sample["gold"], 1.0, "integer")
+            return ScoreResult(task.gold, task.gold, 1.0, "integer")
 
         with contextlib.redirect_stdout(io.StringIO()):
             score_dir, first_summary = await _run_score(_score_args(self.run_dir), evaluate=first_eval)
         self.assertEqual(seen_first, ["1", "2", "3"])
         self.assertEqual(first_summary["scoring_errors"], 1)
 
-        # Simulate sample "3" missing from trajectories.json (as if interrupted mid-scoring)
+        # Simulate task "3" missing from trajectories.json (as if interrupted mid-scoring)
         saved_records = json.loads((score_dir / "trajectories.json").read_text())
         (score_dir / "trajectories.json").write_text(json.dumps([r for r in saved_records if r["task_id"] != "3"]))
 
         seen_resume = []
 
-        async def resume_eval(sample, trace, env_out, config):
-            seen_resume.append(sample["id"])
-            return ScoreResult(sample["gold"], sample["gold"], 1.0, "integer")
+        async def resume_eval(task, trace, env_out, config):
+            seen_resume.append(task.id)
+            return ScoreResult(task.gold, task.gold, 1.0, "integer")
 
         resume_args = _score_args(None, resume=score_dir)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -277,7 +277,7 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "combine"):
             await _run_score(_score_args(self.run_dir, resume=score_dir, output_dir=self.run_dir / "scores/other"))
         with self.assertRaisesRegex(ValueError, "score run"):
-            await gpqa._run_score(_score_args(None, resume=score_dir))
+            await gpqa.run_score(_score_args(None, resume=score_dir))
         with self.assertRaisesRegex(ValueError, "scoring method"):
             resume.init_score_dir(_score_args(None, resume=score_dir), _load_tasks, benchmark="aime", method="other")
         with self.assertRaisesRegex(ValueError, "Source run"):
@@ -299,31 +299,28 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
                         "source_run_dir": str(run_dir.resolve()),
                         "benchmark": name,
                         "scoring_method": "m",
-                        "sample_concurrency": 3,
+                        "concurrency": 3,
                     }
                     if name in ("browsecomp", "agent_abstain"):
                         saved["judge_model"] = ["saved-judge"] if name == "agent_abstain" else "saved-judge"
                         saved["judge_max_tokens"] = 4096
                         saved["enable_thinking"] = False
                         saved["reasoning_effort"] = "low"
-                        saved["concurrency"] = 2
                         saved["timeout"] = 120.0
                     if name == "swe_bench":
                         saved["test_timeout"] = 900.0
                     (score_dir / "config.json").write_text(json.dumps(saved))
 
-                    override_flags = ["--resume", str(score_dir), "--sample-concurrency", "5"]
+                    override_flags = ["--resume", str(score_dir), "--concurrency", "5"]
                     if name in ("browsecomp", "agent_abstain"):
-                        override_flags.extend(
-                            ["--concurrency", "8", "--timeout", "240", "--judge-base-url", "https://judge.new/v1"]
-                        )
+                        override_flags.extend(["--timeout", "240", "--judge-base-url", "https://judge.new/v1"])
                     with patch.dict(os.environ, {}, clear=True), patch.object(scorer, "load_dotenv", create=True):
                         resumed = scorer.parse_args(override_flags)
                     self.assertEqual(Path(resumed.run_dir).resolve(), run_dir.resolve())
-                    self.assertEqual(resumed.sample_concurrency, 5)
+                    self.assertEqual(resumed.concurrency, 5)
                     if name in ("browsecomp", "agent_abstain"):
                         self.assertEqual(resumed.judge_model, saved["judge_model"])
-                        self.assertEqual((resumed.concurrency, resumed.timeout), (8, 240.0))
+                        self.assertEqual(resumed.timeout, 240.0)
                         self.assertEqual(resumed.judge_base_url, "https://judge.new/v1")
                         self.assertFalse(resumed.enable_thinking)
                     if name == "swe_bench":
@@ -510,7 +507,7 @@ class DependencyBoundaryTests(unittest.TestCase):
                     module = node.module or ""
                     self.assertFalse(module.startswith(("model", "harness.env", "harness.tool")), str(path))
                     if module == "agent":
-                        self.assertFalse(any(alias.name in ("react", "run_episode") for alias in node.names), str(path))
+                        self.assertFalse(any(alias.name == "react" for alias in node.names), str(path))
 
     def test_benchmark_imports_stay_inside_their_own_directory_or_common(self):
         root = REPO / "eval/src/eval/benchmarks"
@@ -545,11 +542,14 @@ class DependencyBoundaryTests(unittest.TestCase):
 
 async def _run_score(args, *, evaluate=aime.score):
     with patch.object(aime, "load_tasks", side_effect=_load_tasks), patch.object(aime, "score", evaluate):
-        return await aime._run_score(args)
+        return await aime.run_score(args)
 
 
 def _load_tasks(args):
-    return json.loads(Path(args.dataset_file).read_text())
+    return [
+        Task(str(row["id"]), "system", str(row.get("question", "")), gold=row["gold"], meta=row.get("meta", {}))
+        for row in json.loads(Path(args.dataset_file).read_text())
+    ]
 
 
 def _score_args(run_dir, **extra):
@@ -559,7 +559,6 @@ def _score_args(run_dir, **extra):
                 "run_dir": run_dir,
                 "output_dir": None,
                 "concurrency": 2,
-                "sample_concurrency": 2,
                 "judge_model": "judge",
                 "judge_api_key": "secret",
                 "judge_base_url": "https://judge.example/v1",

@@ -1,5 +1,6 @@
 """Audit every benchmark entrypoint through real MCP sessions and fake model turns."""
 
+import asyncio
 import importlib
 import json
 import tempfile
@@ -53,9 +54,9 @@ class BenchmarkMCPTests(unittest.TestCase):
 
     def test_swe_bench_default_shell_and_files_use_mcp(self):
         bench = importlib.import_module("eval.benchmarks.swe_bench.rollout")
-        sample = bench.load_tasks(bench.parse_args(["--model", "test", "--limit", "1"]))[0]
+        task = bench.load_tasks(bench.parse_args(["--model", "test", "--limit", "1"]))[0]
         with (
-            patch.object(bench, "prepare", AsyncMock(return_value={sample["image"]: "fixture-image"})),
+            patch.object(bench, "prepare", AsyncMock(return_value={task.raw["image"]: "fixture-image"})),
             patch.object(bench.SWEEnv, "setup", AsyncMock()),
             patch.object(bench.SWEEnv, "teardown", AsyncMock()),
             patch.object(bench.SWEEnv, "exec", AsyncMock(return_value=ExecResult("fixture patch", "", 0))),
@@ -72,8 +73,8 @@ class BenchmarkMCPTests(unittest.TestCase):
 
     def test_agent_abstain_custom_tool_uses_mcp_and_records_execution(self):
         bench = importlib.import_module("eval.benchmarks.agent_abstain.rollout")
-        sample = bench.load_tasks(bench.parse_args(["--model", "test", "--limit", "1"]))[0]
-        step = sample["task_yaml"]["execution_dag"]["nodes"][0]
+        task = bench.load_tasks(bench.parse_args(["--model", "test", "--limit", "1"]))[0]
+        step = task.raw["task_yaml"]["execution_dag"]["nodes"][0]
         trace, requests = _run_benchmark(self, "agent_abstain", [_call(step["tool"].replace(".", "_"), step["params"])])
         self.assertEqual(requests[-1]["params"]["name"], step["tool"])
         self.assertEqual(requests[-1]["params"]["arguments"], step["params"])
@@ -120,18 +121,25 @@ def _run_benchmark(test, benchmark, calls):
         requests.append(request.root.model_dump(mode="json", by_alias=True, exclude_none=True))
         return await send_request(session, request, *args, **kwargs)
 
-    ctx = MagicMock(client=MagicMock(close=AsyncMock()))
+    client = MagicMock(close=AsyncMock())
+
+    async def close_client(*_args):
+        await client.close()
+
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(side_effect=close_client)
     turns = [AssistantTurn(content="Completed", finish_reason="stop")]
     if calls:
         turns.insert(0, AssistantTurn(tool_calls=[dict(call, id=f"call_{index}") for index, call in enumerate(calls)]))
     with (
         tempfile.TemporaryDirectory() as directory,
         patch.object(ClientSession, "send_request", record_request),
-        patch.object(bench, "make_context", return_value=ctx),
+        patch.object(bench, "make_client", return_value=client),
         patch.object(agent, "call_model", AsyncMock(side_effect=turns)) as model,
     ):
         output = Path(directory) / "run"
-        test.assertEqual(bench.main(["--model", "test", "--limit", "1", "--output-dir", str(output)]), 0)
+        run_args = bench.parse_args(["--model", "test", "--limit", "1", "--output-dir", str(output)])
+        asyncio.run(bench.rollout(run_args, bench.load_tasks(run_args)))
         trace = load_trajectory(next((output / "trajectories").glob("*.json")))
         test.assertIsNone(trace.error)
         test.assertEqual(model.await_count, 2 if calls else 1)
@@ -139,7 +147,7 @@ def _run_benchmark(test, benchmark, calls):
             evidence = json.loads(next((output / "environment_outputs").glob("*/environment_result.json")).read_text())
             test.assertEqual(len(evidence["data"]["execution_log"]), len(calls))
             test.assertTrue(all(entry["success"] for entry in evidence["data"]["execution_log"]))
-    ctx.client.close.assert_awaited_once()
+    client.close.assert_awaited_once()
     test.assertEqual(
         [request["method"] for request in requests],
         ["initialize", "tools/list", *["tools/call" for _ in calls]] if calls else [],

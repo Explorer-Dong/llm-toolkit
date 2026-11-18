@@ -6,21 +6,20 @@ import json
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
 
 from dotenv import load_dotenv
 
 from ... import ROOT
-from ...agent import Task, Trajectory, run_episode
+from ...agent import Task, Trajectory, react
 from ...harness import add_harness_args
 from ...harness.tool import ToolBox
 from ...harness.utils import save_trajectory
-from ...model import add_model_args, build_model_params, make_context
+from ...model import add_model_args, build_model_params, make_client
 from .._common.resume import finalize_rollout_dir, init_rollout_dir, parse_rollout_args
-from .._common.storage import trajectory_path
+from .._common.storage import cleanup_cancelled_task, trajectory_path
 from .._common.tasks import run_tasks
 
-__all__ = ["parse_args", "load_tasks", "build_task", "run_rollout", "main"]
+__all__ = ["parse_args", "load_tasks", "rollout"]
 
 
 DATA = Path(__file__).parent / "data"
@@ -50,105 +49,69 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def load_tasks(args: argparse.Namespace) -> list[dict[str, Any]]:
+def load_tasks(args: argparse.Namespace) -> list[Task]:
     path = Path(args.dataset_file)
     limit = args.limit
+    max_turns = getattr(args, "max_turns", 1)
+    timeout = getattr(args, "task_timeout", 3600.0)
     rows = json.loads(path.read_text(encoding="utf-8"))
-    tasks: list[dict[str, Any]] = []
+    tasks: list[Task] = []
     for row in rows:
         tasks.append(
-            {
-                "id": str(row["id"]),
-                "problem": str(row["problem"]),
-                "gold": int(row["answer"]),
-            }
+            Task(
+                id=str(row["id"]),
+                system=SYSTEM_PROMPT,
+                prompt=str(row["problem"]),
+                max_turns=max_turns,
+                timeout=timeout,
+                gold=int(row["answer"]),
+            )
         )
         if limit is not None and len(tasks) >= limit:
             break
     if not tasks:
         raise ValueError("No AIME tasks matched the requested filters")
-    for task in tasks:
-        task["meta"] = {}
     return tasks
 
 
-def build_task(sample: dict[str, Any], args: argparse.Namespace) -> Task:
-    return Task(
-        id=str(sample["id"]),
-        system=SYSTEM_PROMPT,
-        prompt=sample["problem"],
-        max_turns=args.max_turns,
-        timeout=args.task_timeout,
-        meta=dict(sample["meta"]),
-    )
-
-
-async def run_rollout(args: argparse.Namespace, samples: list[dict[str, Any]]) -> list[Trajectory]:
+async def rollout(args: argparse.Namespace, tasks: list[Task]) -> list[Trajectory]:
     started = time.perf_counter()
-    tasks = [build_task(sample, args) for sample in samples]
-    run_dir, config, saved_config, completed, pending_pairs = init_rollout_dir(args, samples, tasks)
+    run_dir, config, saved_config, completed, pending = init_rollout_dir(args, tasks)
     new_traces: list[Trajectory] = []
-    ctx = None
     try:
-        if pending_pairs:
-            ctx = make_context(
-                args.base_url,
-                args.api_key,
-                build_model_params(args),
-                args.concurrency,
-                timeout=args.timeout,
-            )
+        if pending:
+            model_params = build_model_params(args)
             tools = ToolBox()
+            async with make_client(args.base_url, args.api_key, timeout=args.timeout) as client:
 
-            async def run_sample(pair: tuple[dict[str, Any], Task]) -> Trajectory:
-                sample_started = time.perf_counter()
-                _, task = pair
-                trajectory_file = trajectory_path(run_dir, task.id)
-                trace = Trajectory(
-                    task.id,
-                    messages=[{"role": "system", "content": task.system}, {"role": "user", "content": task.prompt}],
-                    meta=dict(task.meta),
-                )
-                try:
-                    trace = await run_episode(task, ctx, tools, out=trajectory_file)
-                except asyncio.CancelledError:
-                    trace.episode_status, trace.error = "cancelled", "CancelledError"
-                    trace.runtime_latency_sec = round(time.perf_counter() - sample_started, 6)
-                    save_trajectory(trace, trajectory_file)
-                    raise
-                trace.runtime_latency_sec = round(time.perf_counter() - sample_started, 6)
-                save_trajectory(trace, trajectory_file)
-                return trace
+                async def run_task(task: Task) -> Trajectory:
+                    task_started = time.perf_counter()
+                    try:
+                        trace = await react(task, client, tools, model_params)
+                    except asyncio.CancelledError:
+                        cleanup_cancelled_task(run_dir, task.id)
+                        raise
+                    trace.runtime_latency_sec = round(time.perf_counter() - task_started, 6)
+                    save_trajectory(trace, trajectory_path(run_dir, task.id))
+                    return trace
 
-            new_traces = await run_tasks(
-                pending_pairs, run_sample, concurrency=args.sample_concurrency, desc=args.benchmark
-            )
+                new_traces = await run_tasks(pending, run_task, concurrency=args.concurrency, desc=args.benchmark)
     finally:
-        try:
-            if ctx is not None:
-                await ctx.client.close()
-        finally:
-            by_id = dict(completed)
-            by_id.update({trace.task_id: trace for trace in new_traces})
-            traces = [by_id[task.id] for task in tasks] if len(by_id) == len(tasks) else list(by_id.values())
-            finalize_rollout_dir(
-                run_dir,
-                config,
-                saved_config,
-                started=started,
-                resumed_count=len(completed),
-                benchmark=args.benchmark,
-                traces=traces,
-            )
+        by_id = dict(completed)
+        by_id.update({trace.task_id: trace for trace in new_traces})
+        traces = [by_id[task.id] for task in tasks] if len(by_id) == len(tasks) else list(by_id.values())
+        finalize_rollout_dir(
+            run_dir,
+            config,
+            saved_config,
+            started=started,
+            resumed_count=len(completed),
+            benchmark=args.benchmark,
+            traces=traces,
+        )
     return traces
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    samples = load_tasks(args)
-    traces = asyncio.run(run_rollout(args, samples))
-    return int(any(trace.error is not None for trace in traces))
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    args = parse_args()
+    asyncio.run(rollout(args, load_tasks(args)))

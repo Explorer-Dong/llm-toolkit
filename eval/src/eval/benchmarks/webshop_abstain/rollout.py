@@ -23,17 +23,17 @@ from dotenv import load_dotenv
 from mcp.types import CallToolResult, TextContent, Tool
 
 from ... import ROOT
-from ...agent import Task, Trajectory, run_episode
+from ...agent import Task, Trajectory, react
 from ...harness import add_harness_args
 from ...harness.env import Env
 from ...harness.tool import env_server, open_toolbox
-from ...harness.utils import load_trajectory, save_trajectory
-from ...model import AssistantTurn, add_model_args, build_model_params, make_context
+from ...harness.utils import save_trajectory
+from ...model import AssistantTurn, add_model_args, build_model_params, make_client
 from .._common.resume import finalize_rollout_dir, init_rollout_dir, parse_rollout_args
-from .._common.storage import trajectory_path
+from .._common.storage import cleanup_cancelled_task, trajectory_path
 from .._common.tasks import run_tasks
 
-__all__ = ["WebShopCatalog", "WebShopEnv", "parse_args", "load_tasks", "build_task", "run_rollout", "main"]
+__all__ = ["WebShopCatalog", "WebShopEnv", "parse_args", "load_tasks", "rollout"]
 DATA = Path(__file__).parent / "data"
 DATA_FILE = "webshop_abstain.json"
 _logger = logging.getLogger(__name__)
@@ -159,8 +159,8 @@ class WebShopCatalog:
             self.active_sessions -= 1
             self.condition.notify_all()
 
-    def reset_index(self, sample: dict) -> int:
-        record = sample["record"]
+    def reset_index(self, task: Task) -> int:
+        record = task.raw
         if record["env_variant"] == "pruned_missing_target_251":
             return 0
         base = record.get("base_goal_index")
@@ -245,8 +245,8 @@ class WebShopEnv(Env):
     # Invalid actions use the original WebShop observations and host receipts.
     validate_tool_arguments = False
 
-    def __init__(self, sample: dict, catalog: WebShopCatalog) -> None:
-        self.sample = sample
+    def __init__(self, task: Task, catalog: WebShopCatalog) -> None:
+        self.task = task
         self.catalog = catalog
         self.environment: Any = None
         self.terminated_by: str | None = None
@@ -260,27 +260,28 @@ class WebShopEnv(Env):
         return self.terminated_by is not None
 
     async def setup(self) -> None:
-        server = copy.copy(await self.catalog.get_server(self.sample["record"]["env_variant"]))
+        record = self.task.raw
+        server = copy.copy(await self.catalog.get_server(record["env_variant"]))
         self.borrowed_catalog = True
         server.user_sessions = {}
         from .data.text_environment.envs.web_agent_text_env import WebAgentTextEnv
 
         self.environment = WebAgentTextEnv(
             observation_mode="text",
-            file_path=str(self.catalog.products_path(self.sample["record"]["env_variant"])),
+            file_path=str(self.catalog.products_path(record["env_variant"])),
             server=server,
             human_goals=True,
-            session_prefix=f"instruction-set-{self.sample['id']}-",
+            session_prefix=f"instruction-set-{self.task.id}-",
         )
         server.user_sessions.pop(self.environment.session, None)
-        self.environment.reset(self.catalog.reset_index(self.sample))
+        self.environment.reset(self.catalog.reset_index(self.task))
         state = server.user_sessions[self.environment.session]
         state["goal"] = dict(state["goal"])
-        state["goal"]["instruction_text"] = self.sample["record"]["instruction"]
+        state["goal"]["instruction_text"] = record["instruction"]
         self.environment.browser.get(
             f"{self.environment.base_url}/{self.environment.session}", session_id=self.environment.session
         )
-        self.environment.instruction_text = self.sample["record"]["instruction"]
+        self.environment.instruction_text = record["instruction"]
         self.environment.prev_obs = [self.environment.observation]
         self.environment.prev_actions = []
 
@@ -361,8 +362,8 @@ class WebShopEnv(Env):
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(description="WebShop Abstain")
-    add_model_args(parser, max_tokens=4096, timeout=90, concurrency=4)
-    add_harness_args(parser, max_turns=30)
+    add_model_args(parser, max_tokens=4096, timeout=90)
+    add_harness_args(parser, max_turns=30, concurrency=4)
     parser.set_defaults(
         benchmark="webshop_abstain",
         top_p=None,
@@ -389,7 +390,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def load_tasks(args: argparse.Namespace) -> list[dict]:
+def load_tasks(args: argparse.Namespace) -> list[Task]:
     records = json.loads(Path(args.dataset_file).read_text(encoding="utf-8"))
     seen = set()
     for record in records:
@@ -411,129 +412,95 @@ def load_tasks(args: argparse.Namespace) -> list[dict]:
     records = records[: args.limit]
     if not records:
         raise ValueError("No WebShop Abstain tasks selected")
-    return [
-        {
-            "id": str(record["dataset_index"]),
-            "record": record,
-            "gold": "correct_abstain" if record["should_abstain_expected"] else "correct_buy",
-            "meta": {
-                key: record.get(key)
-                for key in ("dataset_index", "source_id", "variant_type", "category", "env_variant")
-            },
+    max_turns = getattr(args, "max_turns", 30)
+    timeout = getattr(args, "task_timeout", 3600.0)
+    tasks: list[Task] = []
+    for record in records:
+        meta = {
+            key: record.get(key) for key in ("dataset_index", "source_id", "variant_type", "category", "env_variant")
         }
-        for record in records
-    ]
+        tasks.append(
+            Task(
+                str(record["dataset_index"]),
+                ABSTAIN_MULTI_TURN_PROMPT,
+                record["instruction"],
+                max_turns,
+                timeout,
+                meta=meta,
+                gold="correct_abstain" if record["should_abstain_expected"] else "correct_buy",
+                raw=record,
+                final_prompt=None,
+                strict_response=True,
+            )
+        )
+    return tasks
 
 
-def build_task(sample: dict, args: argparse.Namespace) -> Task:
-    return Task(
-        sample["id"],
-        ABSTAIN_MULTI_TURN_PROMPT,
-        sample["record"]["instruction"],
-        args.max_turns,
-        args.task_timeout,
-        meta=dict(sample["meta"]),
-        final_prompt=None,
-        strict_response=True,
-    )
-
-
-async def run_rollout(args: argparse.Namespace, samples: list[dict[str, Any]]) -> list[Trajectory]:
+async def rollout(args: argparse.Namespace, tasks: list[Task]) -> list[Trajectory]:
     started = time.perf_counter()
-    tasks = [build_task(sample, args) for sample in samples]
-    run_dir, config, saved_config, completed, pending_pairs = init_rollout_dir(args, samples, tasks)
+    run_dir, config, saved_config, completed, pending = init_rollout_dir(args, tasks)
     new_traces: list[Trajectory] = []
-    ctx = None
     catalog = WebShopCatalog(args.catalogs_dir, args.java_home)
     try:
-        if pending_pairs:
-            ctx = make_context(
-                args.base_url,
-                args.api_key,
-                build_model_params(args),
-                args.concurrency,
-                timeout=args.timeout,
-                max_retries=getattr(args, "max_retries", 3),
-                request_attempts=getattr(args, "request_attempts", 1),
-                retry_delay=getattr(args, "retry_delay", 1.0),
-            )
+        if pending:
+            model_params = {
+                **build_model_params(args),
+                "request_attempts": getattr(args, "request_attempts", 1),
+                "retry_delay": getattr(args, "retry_delay", 1.0),
+            }
+            async with make_client(
+                args.base_url, args.api_key, timeout=args.timeout, max_retries=getattr(args, "max_retries", 3)
+            ) as client:
 
-            async def run_sample(pair: tuple[dict[str, Any], Task]) -> Trajectory:
-                sample_started = time.perf_counter()
-                sample, task = pair
-                trajectory_file = trajectory_path(run_dir, task.id)
-                trace = Trajectory(
-                    task.id,
-                    messages=[{"role": "system", "content": task.system}, {"role": "user", "content": task.prompt}],
-                    meta=dict(task.meta),
-                )
-                phase = "setup"
-                episode_failure = False
-                try:
-                    env = WebShopEnv(sample, catalog)
-                    async with env:
-                        try:
+                async def run_task(task: Task) -> Trajectory:
+                    task_started = time.perf_counter()
+                    trajectory_file = trajectory_path(run_dir, task.id)
+                    trace = Trajectory(
+                        task.id,
+                        messages=[{"role": "system", "content": task.system}, {"role": "user", "content": task.prompt}],
+                        meta=dict(task.meta),
+                    )
+                    phase = "setup"
+                    try:
+                        env = WebShopEnv(task, catalog)
+                        async with env:
                             task = await env.prepare_task(task)
                             phase = "tools"
                             async with open_toolbox(env_server(env)) as tools:
                                 phase = "episode"
-                                try:
-                                    trace = await run_episode(task, ctx, tools, out=trajectory_file, env=env)
-                                except Exception:
-                                    episode_failure = True
-                                    raise
+                                trace = await react(task, client, tools, model_params, env=env)
                                 phase = "tools_cleanup"
-                        finally:
-                            if trajectory_file.exists():
-                                trace = load_trajectory(trajectory_file)
-                        phase = "teardown"
-                except asyncio.CancelledError:
-                    trace.episode_status, trace.error = "cancelled", "CancelledError"
-                    trace.runtime_latency_sec = round(time.perf_counter() - sample_started, 6)
-                    save_trajectory(trace, trajectory_file)
-                    raise
-                except Exception as exc:
-                    if episode_failure:
+                            phase = "teardown"
+                    except asyncio.CancelledError:
+                        cleanup_cancelled_task(run_dir, task.id)
                         raise
-                    _logger.exception("Runtime %s failed during %s", task.id, phase)
-                    trace.episode_status = "environment_error"
-                    detail = f"{phase}: {type(exc).__name__}: {exc}"
-                    trace.error = f"{trace.error}; {detail}" if trace.error else detail
-                trace.runtime_latency_sec = round(time.perf_counter() - sample_started, 6)
-                save_trajectory(trace, trajectory_file)
-                return trace
+                    except Exception as exc:
+                        _logger.exception("Runtime %s failed during %s", task.id, phase)
+                        trace.episode_status = "environment_error"
+                        detail = f"{phase}: {type(exc).__name__}: {exc}"
+                        trace.error = f"{trace.error}; {detail}" if trace.error else detail
+                    trace.runtime_latency_sec = round(time.perf_counter() - task_started, 6)
+                    save_trajectory(trace, trajectory_file)
+                    return trace
 
-            new_traces = await run_tasks(
-                pending_pairs, run_sample, concurrency=args.sample_concurrency, desc=args.benchmark
-            )
+                new_traces = await run_tasks(pending, run_task, concurrency=args.concurrency, desc=args.benchmark)
     finally:
         try:
             catalog.close()
         finally:
-            try:
-                if ctx is not None:
-                    await ctx.client.close()
-            finally:
-                by_id = dict(completed)
-                by_id.update({trace.task_id: trace for trace in new_traces})
-                traces = [by_id[task.id] for task in tasks] if len(by_id) == len(tasks) else list(by_id.values())
-                finalize_rollout_dir(
-                    run_dir,
-                    config,
-                    saved_config,
-                    started=started,
-                    resumed_count=len(completed),
-                    benchmark=args.benchmark,
-                    traces=traces,
-                )
+            by_id = dict(completed)
+            by_id.update({trace.task_id: trace for trace in new_traces})
+            traces = [by_id[task.id] for task in tasks] if len(by_id) == len(tasks) else list(by_id.values())
+            finalize_rollout_dir(
+                run_dir,
+                config,
+                saved_config,
+                started=started,
+                resumed_count=len(completed),
+                benchmark=args.benchmark,
+                traces=traces,
+            )
     return traces
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    samples = load_tasks(args)
-    traces = asyncio.run(run_rollout(args, samples))
-    return int(any(trace.error is not None for trace in traces))
 
 
 @contextmanager
@@ -682,4 +649,5 @@ def _abstention_type(record: dict) -> str:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    args = parse_args()
+    asyncio.run(rollout(args, load_tasks(args)))

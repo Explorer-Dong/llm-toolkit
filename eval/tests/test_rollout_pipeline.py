@@ -12,7 +12,6 @@ import unittest
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp.server.fastmcp import FastMCP
@@ -27,10 +26,9 @@ from eval.benchmarks.gaia import rollout as gaia_rollout
 from eval.benchmarks.swe_bench import rollout as swe_rollout
 from eval.harness.env import Env, WorkspaceEnv
 from eval.harness.utils import encode_id, load_trajectory, save_trajectory
-from eval.model import AssistantTurn, Context, ModelParams
+from eval.model import AssistantTurn
 
 __all__ = []
-PARAMS = ModelParams("test", 0, 1, 1024, 42)
 
 
 class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -38,7 +36,7 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.run_dir = Path(self.temporary.name) / "run"
-        self.samples: list[dict[str, Any]] = [
+        rows = [
             {
                 "id": str(index),
                 "problem": f"problem-{index}",
@@ -51,9 +49,18 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             }
             for index in range(4)
         ]
-        self.tasks = [Task(sample["id"], "system", "question") for sample in self.samples]
         self.dataset = Path(self.temporary.name) / "dataset.json"
-        self.dataset.write_text(json.dumps(self.samples))
+        self.dataset.write_text(json.dumps(rows))
+        self.tasks = [
+            Task(
+                str(index),
+                "system",
+                f"problem-{index}",
+                gold="secret",
+                raw={"image": f"img-{index}", "base_commit": "a" * 40},
+            )
+            for index in range(4)
+        ]
         self.args = argparse.Namespace(
             benchmark="aime",
             dataset_file=str(self.dataset),
@@ -62,7 +69,6 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             api_key="secret",
             timeout=1,
             concurrency=2,
-            sample_concurrency=2,
             temperature=0,
             top_p=1,
             top_k=0,
@@ -84,18 +90,17 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             crawl4ai_token="",
         )
         self.client = MagicMock(close=AsyncMock())
-        self.ctx = Context(self.client, PARAMS, asyncio.Semaphore(2))
 
-    async def test_sample_task_mismatches_are_rejected_before_runtime_or_output(self):
-        cases = [
-            (self.samples, self.tasks[:-1]),
-            (self.samples, [Task("wrong", "system", "question"), *self.tasks[1:]]),
-            ([self.samples[0], self.samples[0]], [self.tasks[0], self.tasks[0]]),
-        ]
-        for samples, tasks in cases:
-            with self.subTest(ids=[task.id for task in tasks]), self.assertRaises(ValueError):
-                resume.init_rollout_dir(self.args, samples, tasks)
-            self.assertFalse(self.run_dir.exists())
+        async def close_client(*_args):
+            await self.client.close()
+
+        self.client.__aenter__ = AsyncMock(return_value=self.client)
+        self.client.__aexit__ = AsyncMock(side_effect=close_client)
+
+    async def test_duplicate_task_ids_are_rejected_before_runtime_or_output(self):
+        with self.assertRaises(ValueError):
+            resume.init_rollout_dir(self.args, [self.tasks[0], self.tasks[0]])
+        self.assertFalse(self.run_dir.exists())
 
     async def test_default_rollout_directories_handle_second_level_timestamp_collisions(self):
         self.args.output_dir = None
@@ -103,13 +108,13 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(resume, "OUTPUT_DIR", output),
             patch.object(resume, "datetime") as clock,
-            patch.object(aime_rollout, "make_context", return_value=self.ctx),
+            patch.object(aime_rollout, "make_client", return_value=self.client),
             patch.object(agent, "call_model", return_value=AssistantTurn("answer")),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             clock.now.return_value = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
-            await aime_rollout.run_rollout(self.args, self.samples)
-            await aime_rollout.run_rollout(self.args, self.samples)
+            await aime_rollout.rollout(self.args, self.tasks)
+            await aime_rollout.rollout(self.args, self.tasks)
         directories = sorted((output / "aime").iterdir())
         self.assertEqual(len(directories), 2)
         self.assertRegex(directories[0].name, r"^test_\d{8}-\d{6}$")
@@ -145,7 +150,7 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
                 await super().teardown()
                 active -= 1
 
-        async def collect(sample, trace, env, directory):
+        async def collect(task, trace, env, directory):
             self.assertIsNotNone(env.workdir)
             self.assertTrue(env.workdir.exists())
             events.append(("collect", env.workdir))
@@ -156,7 +161,7 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             environments.append(env)
             return env
 
-        async def answer(*args):
+        async def answer(*_args, **_kwargs):
             await asyncio.sleep(0.002)
             return AssistantTurn("answer")
 
@@ -164,11 +169,11 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             patch.object(swe_rollout, "prepare", AsyncMock(return_value={f"img-{i}": f"digest-{i}" for i in range(4)})),
             patch.object(swe_rollout, "SWEEnv", side_effect=make_env),
             patch.object(swe_rollout, "collect", side_effect=collect),
-            patch.object(swe_rollout, "make_context", return_value=self.ctx),
+            patch.object(swe_rollout, "make_client", return_value=self.client),
             patch.object(agent, "call_model", side_effect=answer),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            traces = await swe_rollout.run_rollout(self.args, self.samples)
+            traces = await swe_rollout.rollout(self.args, self.tasks)
         self.assertEqual([t.task_id for t in traces], ["0", "1", "2", "3"])
         self.assertEqual((peak, active), (2, 0))
         self.assertEqual(len({id(env) for env in environments}), 4)
@@ -186,9 +191,9 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.run_dir / "scores").exists())
         self.assertFalse((self.run_dir / "samples.json").exists())
 
-    async def test_active_sample_and_model_concurrency_are_independent(self):
+    async def test_task_concurrency_bounds_active_environments_and_requests(self):
         self.args.benchmark = "swe_bench"
-        self.args.sample_concurrency = 3
+        self.args.concurrency = 3
         entered = peak_envs = active_models = peak_models = 0
 
         class ActiveEnv(Env):
@@ -220,18 +225,18 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             stream.__aiter__.side_effect = chunks
             return stream
 
-        self.ctx.client.chat.completions.create = AsyncMock(side_effect=request)
+        self.client.chat.completions.create = AsyncMock(side_effect=request)
         with (
             patch.object(swe_rollout, "prepare", AsyncMock(return_value={f"img-{i}": f"digest-{i}" for i in range(4)})),
             patch.object(swe_rollout, "SWEEnv", side_effect=ActiveEnv),
             patch.object(swe_rollout, "collect", AsyncMock(return_value={})),
-            patch.object(swe_rollout, "make_context", return_value=self.ctx),
+            patch.object(swe_rollout, "make_client", return_value=self.client),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            await swe_rollout.run_rollout(self.args, self.samples)
-        self.assertEqual((peak_envs, peak_models, entered), (3, 2, 0))
+            await swe_rollout.rollout(self.args, self.tasks)
+        self.assertEqual((peak_envs, peak_models, entered), (3, 3, 0))
 
-    async def test_shared_mcp_lifespan_opens_once_for_all_samples(self):
+    async def test_shared_mcp_lifespan_opens_once_for_all_tasks(self):
         self.args.benchmark = "gaia"
         opened = closed = 0
 
@@ -250,21 +255,21 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
         async def ping(value: str) -> str:
             return value
 
-        async def reply(ctx, messages, tools):
+        async def reply(client, messages, tools, **_params):
             self.assertEqual((opened, closed), (1, 0))
             self.assertEqual(tools[0]["function"]["name"], "ping")
             return AssistantTurn("answer")
 
         with (
-            patch.object(gaia_rollout, "make_context", return_value=self.ctx),
+            patch.object(gaia_rollout, "make_client", return_value=self.client),
             patch.object(gaia_rollout, "common_server", return_value=server),
             patch.object(agent, "call_model", side_effect=reply),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            traces = await gaia_rollout.run_rollout(self.args, self.samples)
+            traces = await gaia_rollout.rollout(self.args, self.tasks)
         self.assertEqual((opened, closed, len(traces)), (1, 1, 4))
 
-    async def test_setup_and_teardown_errors_are_saved_per_sample(self):
+    async def test_setup_and_teardown_errors_are_saved_per_task(self):
         self.args.benchmark = "swe_bench"
         for failure in ("setup", "teardown"):
             self.args.output_dir = str(Path(self.temporary.name) / failure)
@@ -293,11 +298,11 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch.object(swe_rollout, "SWEEnv", side_effect=Broken),
                 patch.object(swe_rollout, "collect", AsyncMock(return_value={})),
-                patch.object(swe_rollout, "make_context", return_value=self.ctx),
+                patch.object(swe_rollout, "make_client", return_value=self.client),
                 patch.object(agent, "call_model", return_value=AssistantTurn("answer")),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
-                traces = await swe_rollout.run_rollout(self.args, self.samples)
+                traces = await swe_rollout.rollout(self.args, self.tasks)
             self.assertEqual(len(closed), 4)
             self.assertTrue(all(t.episode_status == "environment_error" for t in traces))
             self.assertTrue(all(failure in (t.error or "") for t in traces))
@@ -317,11 +322,11 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             patch.object(swe_rollout, "prepare", AsyncMock(return_value={f"img-{i}": f"digest-{i}" for i in range(4)})),
             patch.object(swe_rollout, "SWEEnv", side_effect=make_env),
             patch.object(swe_rollout, "collect", AsyncMock(side_effect=ValueError("evidence failed"))),
-            patch.object(swe_rollout, "make_context", return_value=self.ctx),
+            patch.object(swe_rollout, "make_client", return_value=self.client),
             patch.object(agent, "call_model", return_value=AssistantTurn("answer")),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            traces = await swe_rollout.run_rollout(self.args, self.samples)
+            traces = await swe_rollout.rollout(self.args, self.tasks)
         self.assertTrue(all(e.workdir is None for e in environments))
         self.assertTrue(all(t.episode_status == "environment_error" and t.final_answer == "answer" for t in traces))
         environment_result = json.loads(
@@ -329,7 +334,7 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("evidence failed", environment_result["error"])
 
-    async def test_cancellation_collects_partial_evidence_and_closes_admitted_envs(self):
+    async def test_cancellation_drops_partial_outputs_and_closes_admitted_envs(self):
         self.args.benchmark = "swe_bench"
         active = asyncio.Event()
         environments = []
@@ -340,36 +345,41 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             environments.append(result)
             return result
 
-        async def wait(*args):
+        async def wait(*_args, **_kwargs):
             active.set()
             await asyncio.Event().wait()
 
-        async def collect(sample, trace, env, directory):
-            self.assertIsNotNone(env.workdir)
-            collected.append(sample["id"])
+        async def collect(task, trace, env, directory):
+            collected.append(task.id)
             return {"cancelled": True}
 
         with (
             patch.object(swe_rollout, "prepare", AsyncMock(return_value={f"img-{i}": f"digest-{i}" for i in range(4)})),
             patch.object(swe_rollout, "SWEEnv", side_effect=make_env),
             patch.object(swe_rollout, "collect", side_effect=collect),
-            patch.object(swe_rollout, "make_context", return_value=self.ctx),
+            patch.object(swe_rollout, "make_client", return_value=self.client),
             patch.object(agent, "call_model", side_effect=wait),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            future = asyncio.create_task(swe_rollout.run_rollout(self.args, self.samples))
+            future = asyncio.create_task(swe_rollout.rollout(self.args, self.tasks))
             await active.wait()
             future.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await future
         self.assertTrue(all(e.workdir is None for e in environments))
-        self.assertEqual(len(collected), len(environments))
-        for sample_id in collected:
-            trace = load_trajectory(trajectory_path(self.run_dir, sample_id))
-            self.assertEqual(trace.episode_status, "cancelled")
+        self.assertEqual(collected, [])
+        self.assertEqual(
+            list((self.run_dir / "trajectories").glob("*.json")) if (self.run_dir / "trajectories").exists() else [], []
+        )
+        self.assertEqual(
+            list((self.run_dir / "environment_outputs").iterdir())
+            if (self.run_dir / "environment_outputs").exists()
+            else [],
+            [],
+        )
         self.assertEqual(self.client.close.await_count, 1)
 
-    async def test_cancellation_during_collection_marks_partial_evidence(self):
+    async def test_cancellation_during_collection_drops_partial_outputs(self):
         self.args.benchmark = "swe_bench"
         started = asyncio.Event()
         envs = []
@@ -378,7 +388,8 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             envs.append(WorkspaceEnv())
             return envs[-1]
 
-        async def collect(sample, trace, env, directory):
+        async def collect(task, trace, env, directory):
+            (directory / "patch.diff").write_text("partial diff")
             started.set()
             await asyncio.Event().wait()
 
@@ -386,19 +397,63 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             patch.object(swe_rollout, "prepare", AsyncMock(return_value={f"img-{i}": f"digest-{i}" for i in range(4)})),
             patch.object(swe_rollout, "SWEEnv", side_effect=make),
             patch.object(swe_rollout, "collect", side_effect=collect),
-            patch.object(swe_rollout, "make_context", return_value=self.ctx),
+            patch.object(swe_rollout, "make_client", return_value=self.client),
             patch.object(agent, "call_model", return_value=AssistantTurn("answer")),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            future = asyncio.create_task(swe_rollout.run_rollout(self.args, self.samples))
+            future = asyncio.create_task(swe_rollout.rollout(self.args, self.tasks))
             await started.wait()
             future.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await future
         self.assertTrue(all(env.workdir is None for env in envs))
-        environment_results = list((self.run_dir / "environment_outputs").glob("*/environment_result.json"))
-        self.assertEqual(len(environment_results), len(envs))
-        self.assertTrue(all("CancelledError" in json.loads(p.read_text())["error"] for p in environment_results))
+        self.assertEqual(list((self.run_dir / "trajectories").glob("*.json")), [])
+        self.assertEqual(list((self.run_dir / "environment_outputs").iterdir()), [])
+
+    async def test_cancelled_rollout_keeps_finished_and_drops_interrupted_for_resume(self):
+        self.args.concurrency = 2
+        first_done = asyncio.Event()
+        second_started = asyncio.Event()
+
+        async def reply(client, messages, tools, **_params):
+            if "question-0" in messages[1]["content"]:
+                first_done.set()
+                return AssistantTurn("done-0")
+            await first_done.wait()
+            second_started.set()
+            await asyncio.Event().wait()
+
+        tasks = [Task(str(i), "system", f"question-{i}", gold=i) for i in range(4)]
+        with (
+            patch.object(aime_rollout, "make_client", return_value=self.client),
+            patch.object(agent, "call_model", side_effect=reply),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            future = asyncio.create_task(aime_rollout.rollout(self.args, tasks))
+            await second_started.wait()
+            future.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await future
+
+        saved_files = [p.name for p in (self.run_dir / "trajectories").glob("*.json")]
+        self.assertEqual(saved_files, ["0.json"])
+
+        resumed_ids = []
+
+        async def resume_reply(client, messages, tools, **_params):
+            resumed_ids.append(messages[1]["content"])
+            return AssistantTurn("resumed")
+
+        self.args.output_dir = None
+        self.args.resume = self.run_dir
+        with (
+            patch.object(aime_rollout, "make_client", return_value=self.client),
+            patch.object(agent, "call_model", side_effect=resume_reply),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            traces = await aime_rollout.rollout(self.args, tasks)
+        self.assertEqual(sorted(resumed_ids), ["question-1", "question-2", "question-3"])
+        self.assertEqual([t.final_answer for t in traces], ["done-0", "resumed", "resumed", "resumed"])
 
     async def test_storage_error_propagates_after_env_cleanup(self):
         self.args.benchmark = "swe_bench"
@@ -412,25 +467,25 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             patch.object(swe_rollout, "prepare", AsyncMock(return_value={f"img-{i}": f"digest-{i}" for i in range(4)})),
             patch.object(swe_rollout, "SWEEnv", side_effect=make),
             patch.object(swe_rollout, "collect", AsyncMock(return_value={})),
-            patch.object(swe_rollout, "make_context", return_value=self.ctx),
-            patch("eval.agent.save_trajectory", side_effect=OSError("disk full")),
+            patch.object(swe_rollout, "make_client", return_value=self.client),
+            patch.object(swe_rollout, "save_trajectory", side_effect=OSError("disk full")),
             patch.object(agent, "call_model", return_value=AssistantTurn("answer")),
             contextlib.redirect_stdout(io.StringIO()),
             self.assertRaisesRegex(OSError, "disk full"),
         ):
-            await swe_rollout.run_rollout(self.args, self.samples)
+            await swe_rollout.rollout(self.args, self.tasks)
         self.assertTrue(all(env.workdir is None for env in envs))
         self.assertEqual(self.client.close.await_count, 1)
 
-    async def test_resume_skips_completed_and_reruns_incomplete_samples(self):
+    async def test_resume_skips_completed_and_reruns_incomplete_tasks(self):
         self.args.benchmark = "swe_bench"
         seen_ids = []
 
-        async def collect(sample, trace, env, directory):
-            (directory / "evidence.txt").write_text(f"evidence-{sample['id']}")
-            return {"sample_id": sample["id"]}
+        async def collect(task, trace, env, directory):
+            (directory / "evidence.txt").write_text(f"evidence-{task.id}")
+            return {"sample_id": task.id}
 
-        async def reply(ctx, messages, tools):
+        async def reply(client, messages, tools, **_params):
             seen_ids.append(messages[1]["content"])
             return AssistantTurn("resumed")
 
@@ -441,7 +496,7 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
                     "benchmark": "swe_bench",
                     "model": "test",
                     "dataset_file": str(self.dataset),
-                    "sample_ids": [sample["id"] for sample in self.samples],
+                    "sample_ids": [task.id for task in self.tasks],
                     "collect_environment_outputs": True,
                     "wall_time_sec": 1.5,
                 }
@@ -474,11 +529,11 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
             patch.object(swe_rollout, "prepare", AsyncMock(return_value={f"img-{i}": f"digest-{i}" for i in range(4)})),
             patch.object(swe_rollout, "SWEEnv", side_effect=lambda *_args: WorkspaceEnv()),
             patch.object(swe_rollout, "collect", side_effect=collect),
-            patch.object(swe_rollout, "make_context", return_value=self.ctx),
+            patch.object(swe_rollout, "make_client", return_value=self.client),
             patch.object(agent, "call_model", side_effect=reply),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            traces = await swe_rollout.run_rollout(self.args, self.samples)
+            traces = await swe_rollout.rollout(self.args, self.tasks)
 
         self.assertEqual([t.task_id for t in traces], ["0", "1", "2", "3"])
         self.assertEqual(traces[0].final_answer, "original-0")
@@ -497,35 +552,35 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_resume_all_complete_skips_model_and_server_setup(self):
         with (
-            patch.object(gaia_rollout, "make_context", return_value=self.ctx),
+            patch.object(gaia_rollout, "make_client", return_value=self.client),
             patch.object(gaia_rollout, "common_server", return_value=FastMCP("common")),
             patch.object(agent, "call_model", return_value=AssistantTurn("answer")),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.args.benchmark = "gaia"
-            initial = await gaia_rollout.run_rollout(self.args, self.samples)
+            initial = await gaia_rollout.rollout(self.args, self.tasks)
 
         self.args.output_dir = None
         self.args.resume = self.run_dir
         with (
-            patch.object(gaia_rollout, "make_context", side_effect=AssertionError("should not open client")),
+            patch.object(gaia_rollout, "make_client", side_effect=AssertionError("should not open client")),
             patch.object(gaia_rollout, "open_toolbox", side_effect=AssertionError("should not open toolbox")),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            resumed = await gaia_rollout.run_rollout(self.args, self.samples)
+            resumed = await gaia_rollout.rollout(self.args, self.tasks)
         self.assertEqual(resumed, initial)
 
     async def test_resume_rejects_mismatched_config_and_output_dir(self):
         with (
-            patch.object(aime_rollout, "make_context", return_value=self.ctx),
+            patch.object(aime_rollout, "make_client", return_value=self.client),
             patch.object(agent, "call_model", return_value=AssistantTurn("answer")),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            await aime_rollout.run_rollout(self.args, self.samples)
+            await aime_rollout.rollout(self.args, self.tasks)
 
         with self.assertRaisesRegex(ValueError, "combine"):
             self.args.resume = self.run_dir
-            await aime_rollout.run_rollout(self.args, self.samples)
+            await aime_rollout.rollout(self.args, self.tasks)
 
         self.args.output_dir = None
         for field, value, pattern in (
@@ -536,10 +591,10 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, pattern):
                 bad = argparse.Namespace(**(vars(self.args) | {field: value}))
-                resume.init_rollout_dir(bad, self.samples, self.tasks)
+                resume.init_rollout_dir(bad, self.tasks)
 
         with self.assertRaisesRegex(ValueError, "sample ids"):
-            resume.init_rollout_dir(self.args, self.samples[:-1], self.tasks[:-1])
+            resume.init_rollout_dir(self.args, self.tasks[:-1])
 
     def test_benchmark_parse_args_resume_restores_and_validates_config(self):
         benchmarks = (
@@ -586,8 +641,6 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
                             str(run_dir),
                             "--concurrency",
                             "5",
-                            "--sample-concurrency",
-                            "4",
                             "--timeout",
                             "120",
                             "--base-url",
@@ -596,7 +649,7 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertEqual(resumed.model, "saved-model")
                 self.assertEqual(resumed.limit, 1)
-                self.assertEqual((resumed.concurrency, resumed.sample_concurrency, resumed.timeout), (5, 4, 120.0))
+                self.assertEqual((resumed.concurrency, resumed.timeout), (5, 120.0))
                 self.assertEqual(resumed.base_url, "https://override.example/v1")
                 self.assertEqual(Path(resumed.dataset_file).resolve(), data_file)
                 if name == "aime":

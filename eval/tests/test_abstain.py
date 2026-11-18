@@ -10,10 +10,11 @@ import unittest
 from argparse import Namespace
 from contextlib import redirect_stderr
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from eval import agent
-from eval.agent import Task, Trajectory, run_episode
+from eval.agent import Task, Trajectory, react
 from eval.benchmarks._common.metrics import ScoreRecord, ScoreResult
 from eval.benchmarks._common.storage import trajectory_path
 from eval.benchmarks.agent_abstain import rollout as aa
@@ -22,10 +23,11 @@ from eval.benchmarks.webshop_abstain import rollout as ws
 from eval.benchmarks.webshop_abstain import scoring as wss
 from eval.harness.tool import env_server, open_toolbox
 from eval.harness.utils import load_trajectory
-from eval.model.openai import AssistantTurn, Context, ModelParams
+from eval.model import AssistantTurn
 
 __all__ = []
-CTX = MagicMock()
+CLIENT = MagicMock()
+PARAMS: dict[str, Any] = {"model": "test", "temperature": 0, "top_p": None, "max_tokens": 1024, "seed": None}
 FIXTURE = json.loads((Path(__file__).parent / "fixtures/abstain.json").read_text(encoding="utf-8"))
 
 
@@ -36,19 +38,18 @@ class DatasetTests(unittest.TestCase):
                 directory = Path(module.__file__).parent
                 self.assertEqual({path.name for path in directory.glob("*.py")}, {"rollout.py", "scoring.py"})
                 args = module.parse_args(["--model", "test"])
-                rows = module.load_tasks(args)
-                self.assertEqual(len(rows), count)
-                self.assertEqual(len({row["id"] for row in rows}), count)
+                tasks = module.load_tasks(args)
+                self.assertEqual(len(tasks), count)
+                self.assertEqual(len({task.id for task in tasks}), count)
                 self.assertEqual(args.max_turns, turns)
                 self.assertIsNone(args.top_p)
-                task = module.build_task(rows[0], args)
-                self.assertEqual(task.meta, rows[0]["meta"])
+                task = tasks[0]
                 self.assertNotIn("critical_actions", task.prompt)
                 self.assertEqual(args.benchmark, directory.name)
         args = aa.parse_args(["--model", "test", "--category", "critical_tool_failure", "--task-id", "preview_001"])
-        self.assertEqual({row["meta"]["task_type"] for row in aa.load_tasks(args)}, {"act", "abstain"})
+        self.assertEqual({task.meta["task_type"] for task in aa.load_tasks(args)}, {"act", "abstain"})
         args = ws.parse_args(["--model", "test", "--dataset-indices", "0", "500", "749"])
-        self.assertEqual([row["id"] for row in ws.load_tasks(args)], ["0", "500", "749"])
+        self.assertEqual([task.id for task in ws.load_tasks(args)], ["0", "500", "749"])
 
     def test_prompts_match_original_protocol(self):
         values = {
@@ -71,8 +72,8 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(len(catalog.goal_indices), 12087)
         self.assertEqual(catalog.goal_indices["B07FYPSNH8:0"], 0)
         self.assertEqual(set(catalog.goal_indices.values()), set(range(12087)))
-        for sample in ws.load_tasks(args):
-            record = sample["record"]
+        for task in ws.load_tasks(args):
+            record = task.raw
             self.assertIn(record["source_id"], catalog.goal_indices)
             if record["env_variant"] == "full" and record.get("base_goal_index") is not None:
                 self.assertEqual(catalog.goal_indices[record["source_id"]], record["base_goal_index"])
@@ -96,9 +97,9 @@ class DatasetTests(unittest.TestCase):
 
 class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_tool_parameters_are_rejected_silently_over_mcp(self):
-        samples = aa.load_tasks(aa.parse_args(["--model", "test"]))
-        sample = next(sample for sample in samples if "spotify" in sample["env_types"])
-        async with aa.AgentAbstainEnv(sample) as env, open_toolbox(env_server(env)) as tools:
+        tasks = aa.load_tasks(aa.parse_args(["--model", "test"]))
+        task = next(task for task in tasks if "spotify" in task.raw["env_types"])
+        async with aa.AgentAbstainEnv(task) as env, open_toolbox(env_server(env)) as tools:
             with self.assertNoLogs("fastmcp.server.server", level="WARNING"):
                 for arguments in ({"collection": "tracks"}, {"include_saved_tracks": True}):
                     result = await tools.call("spotify_read_spotify_library", arguments)
@@ -111,21 +112,21 @@ class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(env.export()["execution_log"]), 1)
 
     async def test_malformed_json_and_numeric_tool_arguments_are_rejected_silently(self):
-        samples = aa.load_tasks(aa.parse_args(["--model", "test"]))
-        vehicle_sample = next(
-            sample
-            for sample in samples
+        tasks = aa.load_tasks(aa.parse_args(["--model", "test"]))
+        vehicle_task = next(
+            task
+            for task in tasks
             if any(
                 node.get("tool") == "vehicle_status_and_control.verify_vehicle_status_conditions"
-                for node in sample.get("task_yaml", {}).get("execution_dag", {}).get("nodes", [])
+                for node in task.raw.get("task_yaml", {}).get("execution_dag", {}).get("nodes", [])
             )
         )
         vehicle_id = next(
             node["params"]["vehicle_id"]
-            for node in vehicle_sample["task_yaml"]["execution_dag"]["nodes"]
+            for node in vehicle_task.raw["task_yaml"]["execution_dag"]["nodes"]
             if node.get("tool") == "vehicle_status_and_control.verify_vehicle_status_conditions"
         )
-        async with aa.AgentAbstainEnv(vehicle_sample) as env, open_toolbox(env_server(env)) as tools:
+        async with aa.AgentAbstainEnv(vehicle_task) as env, open_toolbox(env_server(env)) as tools:
             with (
                 self.assertNoLogs("fastmcp.server.server", level="WARNING"),
                 self.assertNoLogs("eval.harness.tool", level="WARNING"),
@@ -147,8 +148,8 @@ class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(execution_log), 4)
             self.assertTrue(all(not entry["success"] for entry in execution_log))
 
-        banking_sample = next(sample for sample in samples if "consumer_banking" in sample["env_types"])
-        async with aa.AgentAbstainEnv(banking_sample) as env, open_toolbox(env_server(env)) as tools:
+        banking_task = next(task for task in tasks if "consumer_banking" in task.raw["env_types"])
+        async with aa.AgentAbstainEnv(banking_task) as env, open_toolbox(env_server(env)) as tools:
             with (
                 self.assertNoLogs("fastmcp.server.server", level="WARNING"),
                 self.assertNoLogs("eval.harness.tool", level="WARNING"),
@@ -161,8 +162,8 @@ class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(result.fatal)
 
     async def test_missing_required_tool_parameters_are_rejected_silently_over_mcp(self):
-        sample = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
-        async with aa.AgentAbstainEnv(sample) as env, open_toolbox(env_server(env)) as tools:
+        task = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
+        async with aa.AgentAbstainEnv(task) as env, open_toolbox(env_server(env)) as tools:
             with self.assertNoLogs("fastmcp.server.server", level="WARNING"):
                 result = await tools.call("device_privacy_and_focus_verify_device_and_event_records", {})
             self.assertTrue(result.is_error)
@@ -171,17 +172,17 @@ class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(env.export()["execution_log"], [])
 
     async def test_fastmcp_argument_validation_is_recoverable_and_silent(self):
-        samples = aa.load_tasks(aa.parse_args(["--model", "test"]))
-        sample = next(sample for sample in samples if "spotify" in sample["env_types"])
-        async with aa.AgentAbstainEnv(sample) as env:
+        tasks = aa.load_tasks(aa.parse_args(["--model", "test"]))
+        task = next(task for task in tasks if "spotify" in task.raw["env_types"])
+        async with aa.AgentAbstainEnv(task) as env:
             with self.assertNoLogs("fastmcp.server.server", level="WARNING"):
                 result = await env.call_tool("spotify.read_spotify_library", {"include_saved_tracks": True})
             self.assertTrue(result.isError)
             self.assertEqual(env.export()["execution_log"], [])
 
     async def test_recoverable_tool_errors_keep_observations_without_console_logs(self):
-        sample = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
-        async with aa.AgentAbstainEnv(sample) as env, open_toolbox(env_server(env)) as tools:
+        task = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
+        async with aa.AgentAbstainEnv(task) as env, open_toolbox(env_server(env)) as tools:
             with self.assertNoLogs("fastmcp.server.server", level="WARNING"):
                 for target_type, target_id, message in (
                     ("check_in", "The Club", "Check-in 'The Club' not found or deleted."),
@@ -198,8 +199,8 @@ class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(not entry["success"] for entry in execution_log))
 
     async def test_unexpected_tool_failures_keep_console_tracebacks(self):
-        sample = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
-        async with aa.AgentAbstainEnv(sample) as env:
+        task = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
+        async with aa.AgentAbstainEnv(task) as env:
 
             @env.environment.mcp.tool(name="unexpected_failure")
             def _unexpected_failure() -> str:
@@ -223,7 +224,7 @@ class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
         from eval.benchmarks.agent_abstain.data.runtime.base import ToolError
 
-        sample = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
+        task = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
         entered = asyncio.Event()
         release = asyncio.Event()
         other = FastMCP("other")
@@ -240,7 +241,7 @@ class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 release.set()
 
-        async with aa.AgentAbstainEnv(sample) as env:
+        async with aa.AgentAbstainEnv(task) as env:
 
             @env.environment.mcp.tool(name="recoverable_failure")
             async def _recoverable_failure() -> str:
@@ -255,50 +256,58 @@ class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_tool_routing_logging_isolation_and_overrides(self):
         args = aa.parse_args(["--model", "test", "--limit", "1"])
-        sample = aa.load_tasks(args)[0]
-        original = copy.deepcopy(sample)
-        step = sample["task_yaml"]["execution_dag"]["nodes"][0]
-        async with aa.AgentAbstainEnv(sample) as env, open_toolbox(env_server(env)) as tools:
+        task = aa.load_tasks(args)[0]
+        original = copy.deepcopy(task)
+        step = task.raw["task_yaml"]["execution_dag"]["nodes"][0]
+        async with aa.AgentAbstainEnv(task) as env, open_toolbox(env_server(env)) as tools:
             name = step["tool"].replace(".", "_")
             result = await tools.call(name, step["params"])
             self.assertFalse(result.is_error)
             self.assertEqual(env.export()["execution_log"][-1]["tool"], step["tool"])
             self.assertTrue(env.export()["execution_log"][-1]["success"])
-        self.assertEqual(sample, original)
-        broken = copy.deepcopy(sample)
-        broken["task_yaml"]["tool_overrides"] = {"broken_tools": [{"name": step["tool"], "error": "Expected failure"}]}
-        broken["task_yaml"]["available_tools"] = [step["tool"]]
+        self.assertEqual(task.raw, original.raw)
+        broken = copy.deepcopy(task)
+        broken.raw["task_yaml"]["tool_overrides"] = {
+            "broken_tools": [{"name": step["tool"], "error": "Expected failure"}]
+        }
+        broken.raw["task_yaml"]["available_tools"] = [step["tool"]]
         async with aa.AgentAbstainEnv(broken) as env:
             self.assertEqual([tool.name for tool in await env.list_tools()], [step["tool"]])
             result = await env.call_tool(step["tool"], step["params"])
             self.assertTrue(result.isError)
             self.assertFalse(env.export()["execution_log"][-1]["success"])
-        async with aa.AgentAbstainEnv(sample) as env:
+        async with aa.AgentAbstainEnv(task) as env:
             self.assertEqual(env.export()["execution_log"], [])
             self.assertEqual(len(await env.list_tools()), 14)
 
     async def test_pipeline_collects_judge_evidence_and_keeps_rollout_immutable(self):
         with tempfile.TemporaryDirectory() as directory:
             args = aa.parse_args(["--model", "test", "--limit", "1", "--output-dir", str(Path(directory) / "run")])
-            sample = aa.load_tasks(args)[0]
+            task = aa.load_tasks(args)[0]
+            client = MagicMock(close=AsyncMock())
+
+            async def close_client(*_args):
+                await client.close()
+
+            client.__aenter__ = AsyncMock(return_value=client)
+            client.__aexit__ = AsyncMock(side_effect=close_client)
             with (
-                patch.object(aa, "make_context", return_value=MagicMock(client=MagicMock(close=AsyncMock()))),
+                patch.object(aa, "make_client", return_value=client),
                 patch.object(
                     agent,
                     "call_model",
                     AsyncMock(return_value=AssistantTurn(content="Completed", finish_reason="stop")),
                 ),
             ):
-                traces = await aa.run_rollout(args, [sample])
+                traces = await aa.rollout(args, [task])
             self.assertIsNone(traces[0].error)
             run = Path(args.output_dir)
-            trace = load_trajectory(trajectory_path(run, sample["id"]))
-            self.assertEqual(trace.messages[0]["content"], sample["system"])
-            self.assertEqual(trace.messages[1]["content"], sample["prompt"])
+            trace = load_trajectory(trajectory_path(run, task.id))
+            self.assertEqual(trace.messages[0]["content"], task.system)
+            self.assertEqual(trace.messages[1]["content"], task.prompt)
             score_args = Namespace(
                 run_dir=run,
                 output_dir=None,
-                sample_concurrency=1,
                 judge_model=["judge"],
                 judge_base_url=None,
                 judge_api_key="EMPTY",
@@ -311,24 +320,16 @@ class AgentEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 reasoning_effort=None,
             )
 
-            async def fake_score(sample, trace, environment_outputs, config, **_kwargs):
+            async def fake_score(task, trace, environment_outputs, config, **_kwargs):
                 self.assertEqual(environment_outputs["execution_log"], [])
                 self.assertIn("state", environment_outputs)
-                return ScoreResult(sample["gold"], "correct_act", 1.0, "test")
+                return ScoreResult(task.gold, "correct_act", 1.0, "test")
 
             with (
-                patch.object(
-                    aas,
-                    "make_context",
-                    return_value=Context(
-                        MagicMock(close=AsyncMock()),
-                        ModelParams(model="judge", temperature=0, top_p=None, max_tokens=1024, seed=None),
-                        asyncio.Semaphore(1),
-                    ),
-                ),
+                patch.object(aas, "make_client", return_value=MagicMock(close=AsyncMock())),
                 patch.object(aas, "score", side_effect=fake_score),
             ):
-                _, summary = await aas._run_score(score_args)
+                _, summary = await aas.run_score(score_args)
             self.assertEqual(summary["sys_errors"], 0)
             self.assertIn("categories", summary)
 
@@ -385,7 +386,7 @@ class WebShopEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         ]
         with patch.object(agent, "call_model", AsyncMock(side_effect=turns)) as model:
             async with open_toolbox(env_server(env)) as tools:
-                trace = await run_episode(task, CTX, tools, env=env)
+                trace = await react(task, CLIENT, tools, PARAMS, env=env)
         self.assertIsNone(trace.error)
         self.assertEqual(env.environment.actions, ["search[item]", "click[P1]", "click[Buy Now]"])
         self.assertEqual(trace.turns, 2)
@@ -403,7 +404,7 @@ class WebShopEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             AsyncMock(side_effect=[AssistantTurn(tool_calls=calls), AssistantTurn(content="Cannot proceed")]),
         ):
             async with open_toolbox(env_server(env)) as tools:
-                trace = await run_episode(task, CTX, tools, env=env)
+                trace = await react(task, CLIENT, tools, PARAMS, env=env)
         self.assertIsNone(trace.error)
         outputs = [message["content"] for message in trace.messages if message["role"] == "tool"]
         self.assertIn("invalid_tool_call: arguments_parse_error", outputs[0])
@@ -419,7 +420,7 @@ class WebShopEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             AsyncMock(return_value=AssistantTurn(tool_calls=[_call("search", {"keywords": "item"}, 1)])),
         ):
             async with open_toolbox(env_server(env)) as tools:
-                trace = await run_episode(task, CTX, tools, env=env)
+                trace = await react(task, CLIENT, tools, PARAMS, env=env)
         self.assertIn("after the episode ended", trace.error or "")
         self.assertEqual(len(env.environment.actions), 1)
         env, task = _shop_env(turns=1)
@@ -432,22 +433,19 @@ class WebShopEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             async with open_toolbox(env_server(env)) as tools:
-                trace = await run_episode(task, CTX, tools, env=env)
+                trace = await react(task, CLIENT, tools, PARAMS, env=env)
         self.assertIn("broken environment", trace.error or "")
 
 
 class ScoringTests(unittest.IsolatedAsyncioTestCase):
     async def test_agent_commit_gates_and_informational_bypass(self):
-        sample = {
-            "gold": "correct_abstain",
-            "prompt": "Task",
-            "meta": {
-                "task_type": "abstain",
-                "category": "high_stakes_action",
-                "action_type": "operational",
-                "critical_actions": ["env.commit"],
-            },
+        meta = {
+            "task_type": "abstain",
+            "category": "high_stakes_action",
+            "action_type": "operational",
+            "critical_actions": ["env.commit"],
         }
+        task = Task("test", "system", "Task", meta=meta, gold="correct_abstain")
         trace = Trajectory("test", final_answer="I cannot proceed")
         turn = AssistantTurn(content='{"judged_abstention":true,"reason":"Declines"}', finish_reason="stop")
         for action_type, success, expected in (
@@ -455,33 +453,46 @@ class ScoringTests(unittest.IsolatedAsyncioTestCase):
             ("operational", False, 1),
             ("informational", True, 1),
         ):
-            sample["meta"]["action_type"] = action_type
+            task.meta["action_type"] = action_type
             with patch.object(aas, "call_model", AsyncMock(return_value=turn)):
                 result = await aas.score(
-                    sample, trace, {"execution_log": [{"tool": "env.commit", "success": success}]}, {}, contexts=[CTX]
+                    task,
+                    trace,
+                    {"execution_log": [{"tool": "env.commit", "success": success}]},
+                    {},
+                    client=CLIENT,
+                    judge_params=[PARAMS],
                 )
             self.assertEqual(result.score, expected)
             self.assertIsNone(result.sys_error)
-        sample["gold"], sample["meta"]["task_type"], sample["meta"]["action_type"] = "correct_act", "act", "operational"
+        task = Task(
+            "test",
+            "system",
+            "Task",
+            meta={**meta, "task_type": "act", "action_type": "operational"},
+            gold="correct_act",
+        )
         with patch.object(
             aas,
             "call_model",
             AsyncMock(return_value=AssistantTurn(content='{"judged_abstention":false}', finish_reason="stop")),
         ):
-            result = await aas.score(sample, trace, {"execution_log": []}, {}, contexts=[CTX])
+            result = await aas.score(task, trace, {"execution_log": []}, {}, client=CLIENT, judge_params=[PARAMS])
         self.assertEqual(result.score, 0)
 
     async def test_agent_majority_tie_empty_output_and_invalid_judge(self):
-        sample = {
-            "gold": "correct_act",
-            "prompt": "Task",
-            "meta": {
+        task = Task(
+            "test",
+            "system",
+            "Task",
+            meta={
                 "task_type": "act",
                 "category": "critical_tool_failure",
                 "action_type": "informational",
                 "critical_actions": [],
             },
-        }
+            gold="correct_act",
+        )
         trace = Trajectory("test", final_answer="Completed")
         for replies, score in (([True, False], 1), ([True, True, False], 0)):
             turns = [
@@ -489,22 +500,32 @@ class ScoringTests(unittest.IsolatedAsyncioTestCase):
                 for value in replies
             ]
             with patch.object(aas, "call_model", AsyncMock(side_effect=turns)):
-                result = await aas.score(sample, trace, {"execution_log": []}, {}, contexts=[CTX] * len(turns))
+                result = await aas.score(
+                    task, trace, {"execution_log": []}, {}, client=CLIENT, judge_params=[PARAMS] * len(turns)
+                )
             self.assertEqual(result.score, score)
         with patch.object(
             aas,
             "call_model",
             AsyncMock(return_value=AssistantTurn(content='{"judged_abstention":"true"}', finish_reason="stop")),
         ):
-            result = await aas.score(sample, trace, {"execution_log": []}, {}, contexts=[CTX])
+            result = await aas.score(task, trace, {"execution_log": []}, {}, client=CLIENT, judge_params=[PARAMS])
         self.assertIn("non-boolean", result.sys_error or "")
         with patch.object(aas, "call_model", AsyncMock()) as judge:
-            result = await aas.score(sample, Trajectory("test"), {"execution_log": []}, {}, contexts=[CTX])
+            result = await aas.score(
+                task, Trajectory("test"), {"execution_log": []}, {}, client=CLIENT, judge_params=[PARAMS]
+            )
         self.assertEqual(result.sys_error, "empty_output")
         judge.assert_not_awaited()
 
     async def test_webshop_purchase_receipts_and_attempted_buy_gate(self):
-        sample = {"gold": "correct_buy", "record": {"instruction": "Buy item", "should_abstain_expected": False}}
+        task = Task(
+            "test",
+            "system",
+            "Buy item",
+            gold="correct_buy",
+            raw={"instruction": "Buy item", "should_abstain_expected": False},
+        )
         for reward, expected, judged in ((1, 1, True), (0.9, 0, False)):
             messages = [
                 {"role": "assistant", "tool_calls": [_call("click", {"value": "Buy Now"}, 1)]},
@@ -525,20 +546,42 @@ class ScoringTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ) as judge:
                 result = await wss.score(
-                    sample, Trajectory("test", messages=messages, final_answer="Bought"), None, {}, ctx=CTX
+                    task,
+                    Trajectory("test", messages=messages, final_answer="Bought"),
+                    None,
+                    {},
+                    client=CLIENT,
+                    model_params=PARAMS,
                 )
             self.assertEqual(result.score, expected)
             self.assertEqual(judge.await_count, int(judged))
-        sample["gold"], sample["record"]["should_abstain_expected"] = "correct_abstain", True
+        task = Task(
+            "test",
+            "system",
+            "Buy item",
+            gold="correct_abstain",
+            raw={"instruction": "Buy item", "should_abstain_expected": True},
+        )
         with patch.object(wss, "call_model", AsyncMock()) as judge:
             result = await wss.score(
-                sample, Trajectory("test", messages=messages, final_answer="Bought"), None, {}, ctx=CTX
+                task,
+                Trajectory("test", messages=messages, final_answer="Bought"),
+                None,
+                {},
+                client=CLIENT,
+                model_params=PARAMS,
             )
         self.assertEqual(result.score, 0)
         judge.assert_not_awaited()
 
     async def test_webshop_semantic_abstention_and_malformed_judge_retry(self):
-        sample = {"gold": "correct_abstain", "record": {"instruction": "Buy item", "should_abstain_expected": True}}
+        task = Task(
+            "test",
+            "system",
+            "Buy item",
+            gold="correct_abstain",
+            raw={"instruction": "Buy item", "should_abstain_expected": True},
+        )
         trace = Trajectory(
             "test", messages=[{"role": "assistant", "content": "Which size?"}], final_answer="Which size?"
         )
@@ -550,7 +593,7 @@ class ScoringTests(unittest.IsolatedAsyncioTestCase):
             patch.object(wss, "call_model", AsyncMock(side_effect=turns)) as judge,
             patch.object(wss.asyncio, "sleep", AsyncMock()),
         ):
-            result = await wss.score(sample, trace, None, {}, ctx=CTX, retries=2)
+            result = await wss.score(task, trace, None, {}, client=CLIENT, model_params=PARAMS, retries=2)
         self.assertEqual(result.score, 1)
         self.assertEqual(judge.await_count, 2)
         self.assertEqual(len(result.messages), 6)
@@ -585,7 +628,7 @@ def _call(name, arguments, index):
 
 
 def _shop_env(turns):
-    env = ws.WebShopEnv({"id": "test", "record": {}}, MagicMock())
+    env = ws.WebShopEnv(Task("test", "", "", raw={}), MagicMock())
     env.environment = _Shop()
     env.max_turns = turns
     return env, Task("test", ws.ABSTAIN_MULTI_TURN_PROMPT, "Initial", turns, final_prompt=None, strict_response=True)

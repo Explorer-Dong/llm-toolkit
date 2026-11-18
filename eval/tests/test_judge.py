@@ -2,20 +2,27 @@
 
 import asyncio
 import unittest
-from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from eval.agent import Trajectory
+from eval import model
+from eval.agent import Task, Trajectory
 from eval.benchmarks._common.metrics import ScoreResult
 from eval.benchmarks.browsecomp import scoring as browsecomp
 from eval.benchmarks.webwalkerqa import scoring as webwalkerqa
-from eval.model import openai as model
 
 __all__ = []
-PARAMS = model.ModelParams(model="test-model", temperature=0, top_p=0.95, max_tokens=8192, seed=42)
-JUDGE_PARAMS = replace(PARAMS, model="test-judge", temperature=0.0, top_p=1.0, max_tokens=4096, enable_thinking=False)
+PARAMS: dict[str, Any] = {"model": "test-model", "temperature": 0, "top_p": 0.95, "max_tokens": 8192, "seed": 42}
+JUDGE_PARAMS: dict[str, Any] = {
+    **PARAMS,
+    "model": "test-judge",
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_tokens": 4096,
+    "enable_thinking": False,
+}
 USAGE = {"prompt_tokens": 10, "completion_tokens": 4, "reasoning_tokens": 2}
 
 
@@ -34,9 +41,13 @@ class BrowseCompJudgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_stream_is_closed_and_error_is_recorded(self):
         client, stream = _make_client([], error=RuntimeError("judge stream failed"))
-        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
         result = await self.scorer.score(
-            {"gold": "gold", "question": "question"}, _agent_result("prediction"), None, {}, ctx=ctx
+            _task(),
+            _agent_result("prediction"),
+            None,
+            {},
+            client=client,
+            model_params=JUDGE_PARAMS,
         )
         self.assertEqual(result.score, 0.0)
         self.assertEqual(result.sys_error, "RuntimeError: judge stream failed")
@@ -58,10 +69,14 @@ class BrowseCompJudgeTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ]
         )
-        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
         with patch.object(self.scorer, "call_model", wraps=model.call_model) as call:
             result = await self.scorer.score(
-                {"gold": "Paris", "question": "Capital?"}, _agent_result("The capital is Paris."), None, {}, ctx=ctx
+                _task("Capital?", "Paris"),
+                _agent_result("The capital is Paris."),
+                None,
+                {},
+                client=client,
+                model_params=JUDGE_PARAMS,
             )
         self.assertIsInstance(result, ScoreResult)
         self.assertEqual(
@@ -81,7 +96,7 @@ class BrowseCompJudgeTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertGreaterEqual(result.messages[-1]["latency_sec"], result.messages[-1]["queue_sec"])
-        call.assert_awaited_once_with(ctx, result.messages)
+        call.assert_awaited_once_with(client, result.messages, **JUDGE_PARAMS)
         request = client.chat.completions.create.call_args.kwargs
         self.assertEqual(
             request["messages"],
@@ -101,9 +116,13 @@ class BrowseCompJudgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_verdict_keeps_the_response_and_records_error(self):
         client, stream = _make_client([_chunk(content="no verdict", finish_reason="length")])
-        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
         result = await self.scorer.score(
-            {"gold": "gold", "question": "question"}, _agent_result("prediction"), None, {}, ctx=ctx
+            _task(),
+            _agent_result("prediction"),
+            None,
+            {},
+            client=client,
+            model_params=JUDGE_PARAMS,
         )
         self.assertEqual(result.score, 0.0)
         self.assertIn("ValueError: judge returned no verdict", result.sys_error or "")
@@ -113,9 +132,13 @@ class BrowseCompJudgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_answer_extracted_is_distinct_from_raw_prediction(self):
         client, _ = _make_client([_chunk(content="extracted_final_answer: None\nreasoning: No answer.\ncorrect: no")])
-        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
         result = await self.scorer.score(
-            {"gold": "gold", "question": "question"}, _agent_result("I do not know."), None, {}, ctx=ctx
+            _task(),
+            _agent_result("I do not know."),
+            None,
+            {},
+            client=client,
+            model_params=JUDGE_PARAMS,
         )
         self.assertEqual(result.score, 0.0)
         self.assertIsNone(result.extracted_prediction)
@@ -123,13 +146,13 @@ class BrowseCompJudgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_agent_failure_does_not_start_judging(self):
         client, _ = _make_client([])
-        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
         result = await self.scorer.score(
-            {"gold": "gold", "question": "question"},
+            _task(),
             _agent_result("partial", sys_error="task_timeout"),
             None,
             {},
-            ctx=ctx,
+            client=client,
+            model_params=JUDGE_PARAMS,
         )
         self.assertEqual(result.score, 0.0)
         self.assertEqual(result.messages, [])
@@ -137,28 +160,40 @@ class BrowseCompJudgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_final_content_does_not_start_judging(self):
         client, _ = _make_client([])
-        ctx = model.Context(client, JUDGE_PARAMS, asyncio.Semaphore(1))
         result = await self.scorer.score(
-            {"gold": "gold", "question": "question"}, _agent_result(None), None, {}, ctx=ctx
+            _task(),
+            _agent_result(None),
+            None,
+            {},
+            client=client,
+            model_params=JUDGE_PARAMS,
         )
         self.assertEqual(result.score, 0.0)
         self.assertEqual(result.messages, [])
         client.chat.completions.create.assert_not_awaited()
 
     async def test_task_cancellation_propagates(self):
-        ctx = model.Context(MagicMock(), JUDGE_PARAMS, asyncio.Semaphore(1))
         with (
             patch.object(self.scorer, "call_model", new_callable=AsyncMock, side_effect=asyncio.CancelledError),
             self.assertRaises(asyncio.CancelledError),
         ):
             await self.scorer.score(
-                {"gold": "gold", "question": "question"}, _agent_result("prediction"), None, {}, ctx=ctx
+                _task(),
+                _agent_result("prediction"),
+                None,
+                {},
+                client=MagicMock(),
+                model_params=JUDGE_PARAMS,
             )
 
 
 class WebWalkerJudgeTests(BrowseCompJudgeTests):
     def setUp(self):
         self.scorer = webwalkerqa
+
+
+def _task(question="question", gold="gold"):
+    return Task("sample", "system", question, gold=gold)
 
 
 def _agent_result(final_content, *, sys_error=None):

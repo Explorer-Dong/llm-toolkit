@@ -4,7 +4,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 
-from ...agent import Trajectory
+from ...agent import Task, Trajectory
 
 __all__ = [
     "ScoreResult",
@@ -98,15 +98,13 @@ def collect_costs(
     }
 
 
-def make_score_record(
-    sample: dict[str, Any], trace: Trajectory, result: ScoreResult, scoring_sec: float
-) -> ScoreRecord:
+def make_score_record(task: Task, trace: Trajectory, result: ScoreResult, scoring_sec: float) -> ScoreRecord:
     return ScoreRecord(
-        str(sample["id"]),
+        task.id,
         result,
         agent_error=trace.error,
         tool_errors=sum(bool(m.get("is_error")) for m in trace.messages if m["role"] == "tool"),
-        metadata=sample.get("meta", {}),
+        metadata=dict(task.meta),
         costs={
             "rollout": collect_costs(
                 trace.messages,

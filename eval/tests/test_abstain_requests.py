@@ -1,23 +1,21 @@
 """Abstention generation defaults and serialized model requests."""
 
-import asyncio
 import json
 import unittest
-from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
 from openai import AsyncOpenAI
 
-from eval.agent import Trajectory
+from eval.agent import Task, Trajectory
 from eval.benchmarks._common.metrics import ScoreResult
 from eval.benchmarks.agent_abstain import rollout as aa
 from eval.benchmarks.agent_abstain import scoring as aas
 from eval.benchmarks.webshop_abstain import rollout as ws
 from eval.benchmarks.webshop_abstain import scoring as wss
-from eval.model.openai import Context, ModelParams, call_model
-from eval.model.utils import build_model_params
+from eval.model import build_model_params, call_model
 
 __all__ = []
 MESSAGES = [{"role": "user", "content": "test"}]
@@ -43,13 +41,13 @@ class AbstainRequestTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_agent_rollout_wire_request(self):
         args = aa.parse_args(["--model", "Qwen3.5-9B"])
-        ctx, requests = _context(build_model_params(args))
+        client, requests = _mock_client()
         messages = [
             *MESSAGES,
             {"role": "assistant", "content": "", "reasoning_content": "previous thought", "usage": {}},
         ]
         try:
-            turn = await call_model(ctx, messages, TOOLS)
+            turn = await call_model(client, messages, TOOLS, **build_model_params(args))
             self.assertIsNone(turn.error)
             self.assertEqual(
                 requests,
@@ -72,17 +70,18 @@ class AbstainRequestTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
         finally:
-            await ctx.client.close()
+            await client.close()
 
     async def test_webshop_rollout_wire_request_and_reasoning_history(self):
         args = ws.parse_args(["--model", "Qwen3.5-9B"])
-        ctx, requests = _context(build_model_params(args))
+        params = build_model_params(args)
+        client, requests = _mock_client()
         messages = [
             *MESSAGES,
             {"role": "assistant", "content": "", "reasoning_content": "previous thought", "usage": {}},
         ]
         try:
-            turn = await call_model(ctx, messages, TOOLS)
+            turn = await call_model(client, messages, TOOLS, **params)
             self.assertIsNone(turn.error)
             self.assertEqual((turn.content, turn.reasoning), ("done", "thought"))
             self.assertEqual(
@@ -100,11 +99,11 @@ class AbstainRequestTests(unittest.IsolatedAsyncioTestCase):
                     "tools": TOOLS,
                 },
             )
-            await call_model(ctx, messages)
+            await call_model(client, messages, **params)
             self.assertNotIn("tools", requests[-1])
             self.assertEqual({k: v for k, v in requests[0].items() if k != "tools"}, requests[-1])
         finally:
-            await ctx.client.close()
+            await client.close()
 
     async def test_agent_judge_wire_request(self):
         await self._check_judge(aas, 16384, 120)
@@ -117,78 +116,83 @@ class AbstainRequestTests(unittest.IsolatedAsyncioTestCase):
         calls = [
             {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": '{"keywords":"jeans"}'}}
         ]
-        ctx, _ = _context(params, tool_calls=calls)
+        client, _ = _mock_client(tool_calls=calls)
         try:
-            turn = await call_model(ctx, MESSAGES, TOOLS)
+            turn = await call_model(client, MESSAGES, TOOLS, **params)
             self.assertIsNone(turn.error)
             self.assertEqual(turn.tool_calls, calls)
             self.assertEqual(turn.finish_reason, "tool_calls")
             self.assertEqual(turn.usage, {"prompt_tokens": 3, "completion_tokens": 2, "reasoning_tokens": 0})
         finally:
-            await ctx.client.close()
+            await client.close()
 
     async def test_webshop_request_attempts_do_not_multiply_sdk_retries(self):
         args = ws.parse_args(["--model", "test"])
-        ctx, requests = _context(build_model_params(args), status=500)
-        ctx = replace(ctx, request_attempts=args.request_attempts, retry_delay=args.retry_delay)
+        client, requests = _mock_client(status=500)
         try:
             with patch("eval.model.openai.asyncio.sleep", new_callable=AsyncMock) as sleep:
-                turn = await call_model(ctx, MESSAGES)
+                turn = await call_model(
+                    client,
+                    MESSAGES,
+                    **build_model_params(args),
+                    request_attempts=args.request_attempts,
+                    retry_delay=args.retry_delay,
+                )
             self.assertIsNotNone(turn.error)
             self.assertEqual(len(requests), 3)
             self.assertEqual([call.args for call in sleep.await_args_list], [(1,), (1,)])
         finally:
-            await ctx.client.close()
+            await client.close()
 
     async def test_agent_judge_retries_transient_errors_only(self):
-        sample = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
+        task = aa.load_tasks(aa.parse_args(["--model", "test", "--limit", "1"]))[0]
+        params: dict[str, Any] = {"model": "judge", "temperature": 0, "top_p": None, "max_tokens": 16384, "seed": None}
         for status, attempts, delays in ((500, 4, [1, 2, 4]), (400, 1, [])):
             with self.subTest(status=status):
-                ctx, requests = _context(ModelParams("judge", 0, None, 16384, None), status=status)
+                client, requests = _mock_client(status=status)
                 try:
                     with patch.object(aas.asyncio, "sleep", new_callable=AsyncMock) as sleep:
                         result = await aas.score(
-                            sample,
-                            Trajectory(sample["id"], final_answer="done"),
+                            task,
+                            Trajectory(task.id, final_answer="done"),
                             {"execution_log": []},
                             {},
-                            contexts=[ctx],
+                            client=client,
+                            judge_params=[params],
                         )
                     self.assertIsNotNone(result.sys_error)
                     self.assertEqual(len(requests), attempts)
                     self.assertEqual([call.args[0] for call in sleep.await_args_list], delays)
                 finally:
-                    await ctx.client.close()
+                    await client.close()
 
     async def _check_judge(self, module, tokens, timeout):
         args = module.parse_args(["unused-run", "--judge-model", "deepseek-flash"])
         self.assertTrue(args.enable_thinking)
         self.assertEqual(args.reasoning_effort, "medium")
         requests = []
-        contexts = []
 
-        def make_context(base_url, api_key, params, concurrency, **options):
+        def make_client(base_url, api_key, **options):
             self.assertEqual(options, {"timeout": timeout, "max_retries": 0})
-            ctx, bodies = _context(params)
-            contexts.append(ctx)
+            client, bodies = _mock_client()
             requests.append(bodies)
-            return ctx
+            return client
 
-        async def run_score_call(sample, *_args, **kwargs):
-            ctx = kwargs["ctx"] if "ctx" in kwargs else kwargs["contexts"][0]
-            turn = await call_model(ctx, MESSAGES)
+        async def run_score_call(task, *_args, **kwargs):
+            params = kwargs["model_params"] if "model_params" in kwargs else kwargs["judge_params"][0]
+            turn = await call_model(kwargs["client"], MESSAGES, **params)
             self.assertIsNone(turn.error)
-            return ScoreResult(sample["gold"], sample["gold"], 1.0, "test")
+            return ScoreResult(task.gold, task.gold, 1.0, "test")
 
-        sample = {"id": "1", "gold": "correct_act", "meta": {}}
+        task = Task("1", "s", "p", gold="correct_act")
         with (
-            patch.object(module, "make_context", side_effect=make_context),
+            patch.object(module, "make_client", side_effect=make_client),
             patch.object(
                 module,
                 "init_score_dir",
                 return_value=(
                     Path("unused-score"),
-                    [sample],
+                    [task],
                     {"1": Trajectory("1", final_answer="done")},
                     {"1": None},
                     {"model": "test"},
@@ -202,7 +206,7 @@ class AbstainRequestTests(unittest.IsolatedAsyncioTestCase):
             patch.object(module, "write_json"),
             patch.object(module, "finalize_score_dir", return_value={}),
         ):
-            await module._run_score(args)
+            await module.run_score(args)
         self.assertEqual(
             requests[0],
             [
@@ -220,7 +224,7 @@ class AbstainRequestTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
-def _context(params, *, status=200, tool_calls=()):
+def _mock_client(*, status=200, tool_calls=()):
     requests = []
 
     def respond(request):
@@ -261,4 +265,4 @@ def _context(params, *, status=200, tool_calls=()):
         max_retries=0,
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),  # ty: ignore[invalid-argument-type]
     )
-    return Context(client, params, asyncio.Semaphore(1)), requests
+    return client, requests

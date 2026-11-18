@@ -51,7 +51,6 @@ uv run --extra webshop_abstain rollout webshop_abstain
 # SWE (docker required)
 uv run rollout swe_bench \
   --limit 2 \
-  --sample-concurrency 2 \
   --concurrency 2
 
 # see more options
