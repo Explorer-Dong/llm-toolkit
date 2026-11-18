@@ -1,7 +1,6 @@
 """Real limit-N inference and independent scoring for all benchmark commands."""
 
 import argparse
-import hashlib
 import json
 import math
 import re
@@ -13,16 +12,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from harness import load_trajectory
-from harness.model import add_thinking_args
-
 from eval import OUTPUT_DIR, ROOT
+from eval.harness.utils import load_trajectory
 
 __all__ = ["main"]
 
-BENCHMARKS = ("aime", "gpqa", "math", "gaia", "browsecomp", "webwalkerqa", "swe_bench")
-RETRIEVAL_BENCHMARKS = {"gaia", "browsecomp", "webwalkerqa"}
-JUDGE_BENCHMARKS = {"browsecomp", "webwalkerqa"}
+BENCHMARKS = (
+    "aime",
+    "gpqa",
+    "math",
+    "gaia",
+    "browsecomp",
+    "webwalkerqa",
+    "swe_bench",
+    "agent_abstain",
+    "webshop_abstain",
+)
+MULTITURN_BENCHMARKS = {"gaia", "browsecomp", "webwalkerqa", "agent_abstain", "webshop_abstain"}
+JUDGE_BENCHMARKS = {"browsecomp", "webwalkerqa", "agent_abstain", "webshop_abstain"}
 
 
 def main() -> int:
@@ -35,7 +42,15 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--task-timeout", type=float, default=300)
     parser.add_argument("--output-dir", type=Path)
-    add_thinking_args(parser)
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable model thinking (default: enabled)",
+    )
+    parser.add_argument(
+        "--reasoning-effort", default="medium", metavar="LEVEL", help="reasoning effort (default: medium)"
+    )
     args = parser.parse_args()
     if min(args.limit, args.parallel, args.max_tokens, args.max_turns, args.timeout, args.task_timeout) <= 0:
         parser.error("smoke limits and timeouts must be positive")
@@ -64,8 +79,7 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
     command = [
         sys.executable,
         "-m",
-        "eval.inference",
-        benchmark,
+        f"eval.benchmarks.{benchmark}.rollout",
         "--limit",
         str(2 if benchmark == "swe_bench" else args.limit),
         "--max-tokens",
@@ -88,8 +102,8 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
         args.reasoning_effort,
     ]
     if not args.enable_thinking:
-        command.append("--disable-thinking")
-    if benchmark in RETRIEVAL_BENCHMARKS:
+        command.append("--no-enable-thinking")
+    if benchmark in MULTITURN_BENCHMARKS:
         command.extend(["--max-turns", str(args.max_turns)])
     if benchmark == "swe_bench":
         command.extend(
@@ -107,7 +121,7 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
             ]
         )
     started = time.perf_counter()
-    inference = subprocess.run(
+    rollout = subprocess.run(
         command,
         cwd=ROOT,
         capture_output=True,
@@ -115,16 +129,16 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
         timeout=1800 if benchmark == "swe_bench" else args.task_timeout + 180,
         check=False,
     )
-    inference_sec = round(time.perf_counter() - started, 3)
-    match = re.search(r"output: (.+)", inference.stdout)
+    rollout_sec = round(time.perf_counter() - started, 3)
+    match = re.search(r"output: (.+)", rollout.stdout)
     if match is None:
-        raise RuntimeError(f"inference failed: {inference.stderr[-2000:]}")
+        raise RuntimeError(f"rollout failed: {rollout.stderr[-2000:]}")
     run_dir = Path(match.group(1).strip())
     config = json.loads((run_dir / "config.json").read_text())
     if (run_dir / "samples.json").exists():
-        raise RuntimeError("Inference saved a redundant dataset copy")
-    if benchmark != "swe_bench" and (run_dir / "artifacts").exists():
-        raise RuntimeError("Inference created an empty evidence directory")
+        raise RuntimeError("Rollout saved a redundant dataset copy")
+    if not config["collect_environment_outputs"] and (run_dir / "environment_outputs").exists():
+        raise RuntimeError("Rollout created an empty evidence directory")
     paths = sorted((run_dir / "trajectories").glob("*.json"))
     trajectories = [load_trajectory(path) for path in paths]
     if {trajectory.task_id for trajectory in trajectories} != set(config["sample_ids"]):
@@ -136,14 +150,13 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
         for key, count in trajectory.usage.items():
             if count != sum((message.get("usage") or {}).get(key, 0) for message in assistants):
                 raise RuntimeError(f"trajectory {key} differs from per-turn usage")
-    inference_files = [path for path in run_dir.rglob("*") if path.is_file()]
-    before = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inference_files}
+    rollout_files = [path for path in run_dir.rglob("*") if path.is_file()]
+    before = {str(path): path.read_bytes() for path in rollout_files}
     started = time.perf_counter()
     score_command = [
         sys.executable,
         "-m",
-        "eval.scoring",
-        benchmark,
+        f"eval.benchmarks.{benchmark}.scoring",
         str(run_dir),
         "--sample-concurrency",
         "2" if benchmark == "swe_bench" else "1",
@@ -152,7 +165,7 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
         score_command.extend(["--timeout", str(args.timeout), "--concurrency", "1"])
         score_command.extend(["--reasoning-effort", args.reasoning_effort])
         if not args.enable_thinking:
-            score_command.append("--disable-thinking")
+            score_command.append("--no-enable-thinking")
     scoring = subprocess.run(
         score_command,
         cwd=ROOT,
@@ -175,44 +188,44 @@ def _run_benchmark(benchmark: str, args: argparse.Namespace, output: Path) -> di
     if {record["task_id"] for record in records} != set(config["sample_ids"]):
         raise RuntimeError("Score records differ from the selected sample IDs")
     cost = summary["costs"]
-    inferred_tokens = sum(t.usage["prompt_tokens"] + t.usage["completion_tokens"] for t in trajectories)
+    rollout_tokens = sum(t.usage["prompt_tokens"] + t.usage["completion_tokens"] for t in trajectories)
     scored_models = [m for r in records for m in r["score_result"]["messages"] if m["role"] == "assistant"]
     scored_tokens = sum(
         (m.get("usage") or {}).get(key, 0) for m in scored_models for key in ("prompt_tokens", "completion_tokens")
     )
-    if (cost["inference"]["tokens"]["total_tokens"], cost["scoring"]["tokens"]["total_tokens"]) != (
-        inferred_tokens,
+    if (cost["rollout"]["tokens"]["total_tokens"], cost["scoring"]["tokens"]["total_tokens"]) != (
+        rollout_tokens,
         scored_tokens,
     ):
         raise RuntimeError("Summary tokens differ from the saved model responses")
     if cost["total"]["calls"]["model"] != sum(t.turns for t in trajectories) + len(scored_models):
         raise RuntimeError("Summary model calls differ from saved turns")
     if not math.isclose(
-        cost["total"]["tokens"]["mean_per_task"]["total_tokens"], (inferred_tokens + scored_tokens) / len(records)
+        cost["total"]["tokens"]["mean_per_task"]["total_tokens"], (rollout_tokens + scored_tokens) / len(records)
     ):
         raise RuntimeError("Token means must include all selected samples")
-    if cost["inference"]["time_sec"]["wall"] != config["wall_time_sec"]:
-        raise RuntimeError("Inference wall time differs from the run manifest")
+    if cost["rollout"]["time_sec"]["wall"] != config["wall_time_sec"]:
+        raise RuntimeError("Rollout wall time differs from the run configuration")
     if any(t.runtime_latency_sec is None for t in trajectories):
         raise RuntimeError("A trajectory is missing runtime timing")
     if any(
         cost[phase]["time_sec"][key] is None
-        for phase in ("inference", "scoring", "total")
+        for phase in ("rollout", "scoring", "total")
         for key in ("sample", "model", "model_queue", "tool", "wall")
     ):
         raise RuntimeError("A summary is missing recorded timing")
-    after = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in inference_files}
+    after = {str(path): path.read_bytes() for path in rollout_files}
     unchanged = before == after
     result = {
         "benchmark": benchmark,
-        "passed": inference.returncode == scoring.returncode == 0 and unchanged and summary["sys_errors"] == 0,
-        "inference_exit_code": inference.returncode,
+        "passed": rollout.returncode == scoring.returncode == 0 and unchanged and summary["sys_errors"] == 0,
+        "rollout_exit_code": rollout.returncode,
         "scoring_exit_code": scoring.returncode,
-        "inference_sec": inference_sec,
+        "rollout_sec": rollout_sec,
         "scoring_sec": scoring_sec,
         "run_dir": str(run_dir),
         "score_dir": str(score_dir),
-        "inference_artifacts_unchanged": unchanged,
+        "rollout_outputs_unchanged": unchanged,
         "num_without_final_answer": sum(trajectory.final_answer is None for trajectory in trajectories),
         "tokens": {phase: cost[phase]["tokens"]["total_tokens"] for phase in cost},
         "model_calls": {phase: cost[phase]["calls"]["model"] for phase in cost},

@@ -1,48 +1,61 @@
-# Evaluation
+# Model evaluation
 
-Inference and scoring.
+All commands below are from `eval/`.
 
 ## Setup
 
-From `eval/`:
+setup dependencies:
 
 ```bash
+# regular benchmark
 uv sync --group dev
-cp .env.example .env
+
+# agent abstain benchmark
+uv sync --group dev --extra agent_abstain
+
+# webshop abstain benchmark
+uv sync --group dev --extra webshop_abstain
+
+# swe_bench benchmark
+uv sync --group dev --extra swe_bench
 ```
 
-| Connection | Environment variables |
-| --- | --- |
-| Model | `MODEL_NAME`, `BASE_URL`, `API_KEY` |
-| DS search / DS fetch | `DS_TOOL_KEY` |
-| LLM judge | `JUDGE_MODEL`, `JUDGE_BASE_URL`, `JUDGE_API_KEY` |
-| (Optional) Serper search | `SERPER_API_KEY`; select `--search-provider serper` |
-| (Optional) Crawl4AI fetch | `CRAWL4AI_URL`, `CRAWL4AI_TOKEN`; select `--fetch-provider crawl4ai` |
+>WebShop Abstain requires Java 21 and the assets described in [data/README.md](src/eval/benchmarks/webshop_abstain/data/README.md).
 
-- Search and fetch default to DeepSeek.
-- Local Crawl4AI: `docker compose up -d`.
-
-## Inference
+setup environment variables:
 
 ```bash
-# single-turn
-uv run eval-inference aime --year 2026
-uv run eval-inference gpqa
-uv run eval-inference math
+cp .env.example .env
 
-# multi-turn
-uv run eval-inference gaia
-uv run eval-inference browsecomp
-uv run eval-inference webwalkerqa
+# then edit the .env file with your model endpoint and tool provider
+```
 
-# swe-like bench (docker required)
-uv run eval-inference swe_bench \
+
+## Rollout
+
+```bash
+# QA
+uv run rollout aime --year 2026
+uv run rollout gpqa
+uv run rollout math
+
+# Web search (Deep Research)
+uv run rollout gaia
+uv run rollout browsecomp
+uv run rollout webwalkerqa
+
+# Abstention
+uv run --extra agent_abstain rollout agent_abstain
+uv run --extra webshop_abstain rollout webshop_abstain
+
+# SWE (docker required)
+uv run rollout swe_bench \
   --limit 2 \
   --sample-concurrency 2 \
   --concurrency 2
 
 # see more options
-uv run eval-inference <benchmark> --help
+uv run rollout <benchmark> --help
 ```
 
 | Benchmarks | Default turns | Scoring |
@@ -50,93 +63,43 @@ uv run eval-inference <benchmark> --help
 | AIME / GPQA / MATH | 1 | Integer / choice / symbolic equivalence |
 | GAIA | 16 | Normalized answer |
 | BrowseComp / WebWalkerQA | 16 | LLM judge |
-| SWE-bench Verified (Easy) | 40 | Official tests |
-
-| Option | Effect |
-| --- | --- |
-| `--limit N` | First N matching samples |
-| `--max-turns N` | Model completion budget; `--max-steps` is an alias |
-| `--task-timeout S` | Episode budget; `0` disables it |
-| `--concurrency N` | Model requests across all samples |
-| `--sample-concurrency N` | Active samples, including runtime setup and cleanup |
-| `--output-dir PATH` | New inference directory |
-| `--disable-thinking` | Disable thinking; (default `enabled`) |
-| `--reasoning-effort LEVEL` | Reasoning effort; (default `medium`) |
+| SWE-bench Verified (Easy) | 40 | Unit tests |
+| Agent Abstain | 30 | Successful critical tools + LLM judge |
+| WebShop Abstain | 30 | Purchase receipts + LLM judge |
 
 ## Scoring
 
 ```bash
-# rubric-based bench
-uv run eval-scoring aime outputs/aime/<run>
+uv run scoring <benchmark> outputs/<benchmark>/<run>
 
-# judge-based bench
-uv run eval-scoring browsecomp outputs/browsecomp/<run> \
-  --judge-model <model>
-
-# sandbox-based bench
-uv run --extra swe_bench eval-scoring swe_bench outputs/swe_bench/<run> \
-  --sample-concurrency 2
+# see more options
+uv run scoring <benchmark> --help
 ```
-
-- LLM judges use the same `--disable-thinking` and `--reasoning-effort` options.
-- Each invocation creates a new score directory; second-level timestamps use `-1`, `-2`, ... for collisions.
-- Rule-based, LLM-judge, and hybrid policies live in each benchmark's `scoring.py`.
-- Scoring loads the original dataset and verifies its hash and selected sample IDs.
-- Inference evidence is checked before and after scoring.
-- SWE-bench applies saved patches in fresh containers. Official scoring requires the `swe_bench` extra (`swebench==5.0.2`).
 
 ## Outputs
 
 ```text
 outputs/<benchmark>/<model>_<timestamp>/
-├── config.json                        # options, dataset hash, selected sample IDs
-├── trajectories/<encoded-id>.json     # harness execution
-├── artifacts/<encoded-id>/            # collected evidence, when needed
-│   ├── manifest.json                  # evidence metadata and hashes
-│   └── ...                            # e.g. patch.diff
+├── config.json                           # rollout configuration
+├── trajectories/<encoded-id>.json        # agent trajectories
+├── environment_outputs/<encoded-id>/     # (Optional) environment status
 └── scores/<timestamp>/
-    ├── config.json
+    ├── config.json                       # scoring configuration
     ├── trajectories.json
-    └── summary.json
+    └── summary.json                      # rollout and scoring results
 ```
-
-`summary.json` groups costs under `costs.inference`, `costs.scoring`, and `costs.total`.
-
-| Category | Totals and means |
-| --- | --- |
-| `tokens` | Prompt, completion, reasoning, cached, total; per task and model call |
-| `time_sec` | Wall time, cumulative sample/episode time, model time, queue time, runtime call time; per task/call |
-| `calls` | Model calls, calls reporting usage, runtime calls, runtime errors; per task |
-| `by_tool` | Calls, errors, cumulative time and means for each runtime operation |
-
-- `total_tokens = prompt_tokens + completion_tokens`; reasoning and cached tokens are reported separately.
-- Model calls count agent/judge turns. Runtime calls count recorded operations.
-- Means include failed samples. Unavailable timing values are `null`.
-- Sample time includes runtime setup and cleanup; inference episode time covers the agent loop.
 
 ## Layout
 
 ```text
 src/eval/
-├── inference.py    # runtime lifecycle and trajectory storage
-├── scoring.py      # scoring orchestration and cost summaries
-├── utils.py        # shared scheduling and storage
-└── benchmarks/<name>/
-    ├── inference.py    # dataset loading and agent rollout
-    ├── scoring.py      # scoring rules, judge calls, and scoring entrypoint
-    └── data/           # dataset and benchmark assets
+├── agent.py            # agent = model + harness (ReAct loop and episode runner)
+├── model/              # model providers, request parameters, and CLI/param utils
+├── harness/            # harness tools, environments, and CLI/storage utils
+└── benchmarks/
+    ├── _common/        # shared benchmark CLI, task runner, resume, storage, and metrics helpers
+    └── <name>/
+        ├── rollout.py      # benchmark-specific rollout
+        ├── scoring.py      # benchmark-specific scoring
+        └── data/           # dataset and benchmark-specific assets
 ```
-
-- Add a benchmark directory; use AIME or SWE-bench as an example.
-- Inference: `eval-inference <name>` or `python -m eval.benchmarks.<name>.inference`.
-- Scoring: `eval-scoring <name> <run_dir>` or `python -m eval.benchmarks.<name>.scoring <run_dir>`.
-- Eval owns runtime lifecycles; harness saves trajectories.
-
-## Tests
-
-```bash
-uv run --extra swe_bench python -m unittest discover -s tests
-uv run --extra swe_bench python tests/smoke.py --limit 1
-```
-
-[Static checks and provider smoke tests](tests/README.md).

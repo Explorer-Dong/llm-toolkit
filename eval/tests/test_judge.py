@@ -7,11 +7,11 @@ from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from harness import Trajectory, model
-
+from eval.agent import Trajectory
+from eval.benchmarks._common.metrics import ScoreResult
 from eval.benchmarks.browsecomp import scoring as browsecomp
 from eval.benchmarks.webwalkerqa import scoring as webwalkerqa
-from eval.scoring import ScoreResult
+from eval.model import openai as model
 
 __all__ = []
 PARAMS = model.ModelParams(model="test-model", temperature=0, top_p=0.95, max_tokens=8192, seed=42)
@@ -26,7 +26,7 @@ class BrowseCompJudgeTests(unittest.IsolatedAsyncioTestCase):
     def test_judge_cli_thinking_defaults_and_override(self):
         with patch.object(self.scorer, "load_dotenv"):
             defaults = self.scorer.parse_args(["saved-run"])
-            disabled = self.scorer.parse_args(["saved-run", "--disable-thinking", "--reasoning-effort", "high"])
+            disabled = self.scorer.parse_args(["saved-run", "--no-enable-thinking", "--reasoning-effort", "high"])
         self.assertTrue(defaults.enable_thinking)
         self.assertEqual(defaults.reasoning_effort, "medium")
         self.assertFalse(disabled.enable_thinking)
@@ -119,7 +119,7 @@ class BrowseCompJudgeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.score, 0.0)
         self.assertIsNone(result.extracted_prediction)
-        self.assertEqual(result.messages[-1]["finish_reason"], "unknown")
+        self.assertIsNone(result.messages[-1]["finish_reason"])
 
     async def test_agent_failure_does_not_start_judging(self):
         client, _ = _make_client([])

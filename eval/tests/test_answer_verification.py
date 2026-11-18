@@ -2,13 +2,12 @@
 
 import unittest
 
-from harness import Trajectory
-
+from eval.agent import Trajectory
+from eval.benchmarks._common.metrics import ScoreResult
 from eval.benchmarks.aime import scoring as aime
 from eval.benchmarks.gaia import scoring as gaia
 from eval.benchmarks.gpqa import scoring as gpqa
 from eval.benchmarks.math import scoring as math
-from eval.scoring import ScoreResult
 
 __all__ = []
 

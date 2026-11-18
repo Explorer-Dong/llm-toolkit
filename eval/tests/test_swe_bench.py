@@ -1,15 +1,20 @@
 """SWE-bench selection, reference isolation, patch evidence, and fresh grading."""
 
+import contextlib
+import io
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from harness import DockerEnv, ExecResult, Trajectory
-from harness.utils import encode_id
-
-from eval.benchmarks.swe_bench import inference as swe
+from eval.agent import Trajectory
+from eval.benchmarks._common.storage import PACKAGE_DIR, save_environment_result, trajectory_path
+from eval.benchmarks.swe_bench import rollout as swe
 from eval.benchmarks.swe_bench import scoring as swe_scoring
+from eval.harness.env import DockerEnv, ExecResult
+from eval.harness.utils import encode_id, save_trajectory
 
 __all__ = []
 
@@ -70,20 +75,20 @@ class SWEbenchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_collect_captures_patch_without_persisting_the_repository(self):
         with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp) / "artifacts" / encode_id(self.samples[0]["id"])
+            directory = Path(tmp) / "environment_outputs" / encode_id(self.samples[0]["id"])
             directory.mkdir(parents=True)
-            env = MagicMock(image="repo@sha256:first", container="inference")
+            env = MagicMock(image="repo@sha256:first", container="rollout")
             env.exec = AsyncMock(return_value=ExecResult("model patch\n", "", 0))
             data = await swe.collect(self.samples[0], Trajectory(self.samples[0]["id"]), env, directory)
             self.assertEqual((directory / "patch.diff").read_text(), "model patch\n")
             self.assertEqual({p.name for p in directory.iterdir()}, {"patch.diff"})
-            self.assertEqual(data["inference_container"], "inference")
+            self.assertEqual(data["rollout_container"], "rollout")
             self.assertIn(self.samples[0]["base_commit"], env.exec.call_args.args[0])
 
     async def test_offline_score_applies_saved_patch_in_a_fresh_container(self):
         with tempfile.TemporaryDirectory() as tmp:
             sample = self.samples[0]
-            directory = Path(tmp) / "artifacts" / encode_id(sample["id"])
+            directory = Path(tmp) / "environment_outputs" / encode_id(sample["id"])
             directory.mkdir(parents=True)
             (directory / "patch.diff").write_text("saved model patch")
             fresh = MagicMock(container="fresh-scoring")
@@ -101,7 +106,7 @@ class SWEbenchTests(unittest.IsolatedAsyncioTestCase):
                 result = await swe_scoring.score(
                     sample,
                     Trajectory(sample["id"]),
-                    {"patch_file": "patch.diff", "image": "repo@sha256:original", "inference_container": "old"},
+                    {"patch_file": "patch.diff", "image": "repo@sha256:original", "rollout_container": "old"},
                     {"model": "fixture"},
                     args=swe_scoring.parse_args([str(Path(tmp))]),
                 )
@@ -112,6 +117,48 @@ class SWEbenchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.messages[0]["scoring_container"], "fresh-scoring")
             scope.__aexit__.assert_awaited_once()
             self.assertEqual((directory / "patch.diff").read_text(), "saved model patch")
+
+    def test_resume_prepares_only_unfinished_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            data_file = Path(self.args.dataset_file).resolve()
+            (run_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "benchmark": "swe_bench",
+                        "model": "fixture",
+                        "subset": "easy",
+                        "limit": 2,
+                        "dataset_file": str(data_file.relative_to(PACKAGE_DIR)),
+                        "sample_ids": [s["id"] for s in self.samples],
+                        "collect_environment_outputs": True,
+                    }
+                )
+            )
+            done_id = self.samples[0]["id"]
+            save_trajectory(Trajectory(done_id, final_answer="fixed"), trajectory_path(run_dir, done_id))
+            env_dir = run_dir / "environment_outputs" / encode_id(done_id)
+            env_dir.mkdir(parents=True)
+            (env_dir / "patch.diff").write_text("diff")
+            save_environment_result(env_dir, done_id, {"patch_file": "patch.diff"}, None)
+
+            seen_images = []
+
+            async def fake_prepare(pending, *, concurrency):
+                seen_images.extend(sample["id"] for sample in pending)
+                return {sample["image"]: f"digest:{sample['id']}" for sample in pending}
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(swe, "load_dotenv"),
+                patch.object(swe, "prepare", side_effect=fake_prepare),
+                patch.object(swe, "make_context", side_effect=RuntimeError("stop after prepare")),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "stop after prepare"),
+            ):
+                swe.main(["--resume", str(run_dir)])
+            self.assertEqual(seen_images, [self.samples[1]["id"]])
 
 
 if __name__ == "__main__":

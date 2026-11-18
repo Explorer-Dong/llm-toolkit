@@ -7,9 +7,9 @@ import os
 import sys
 
 from dotenv import load_dotenv
-from harness.tool import ToolConfig, common_server, open_toolbox
 
 from eval import ROOT
+from eval.harness.tool import ToolConfig, common_server, open_toolbox
 
 __all__ = ["main"]
 

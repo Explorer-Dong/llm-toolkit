@@ -1,0 +1,171 @@
+"""Task records, bounded ReAct loop, and episode execution."""
+
+import asyncio
+import copy
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .harness.env import Env
+from .harness.tool import ToolBox, ToolResponse
+from .harness.utils import save_trajectory
+from .model import Context, call_model
+
+__all__ = ["Task", "Trajectory", "ModelResponseError", "react", "run_episode"]
+_logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Task:
+    id: str
+    system: str
+    prompt: str
+    max_turns: int = 1
+    timeout: float | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+    final_prompt: str | None = (
+        "No steps remain. Do not call any more tools. Reply now with only the final answer "
+        "in the format required by the system prompt."
+    )
+    strict_response: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.id:
+            raise ValueError("Task id must be nonempty")
+        if self.max_turns < 1:
+            raise ValueError("max_turns must be positive")
+        if self.timeout is not None and self.timeout < 0:
+            raise ValueError("Task timeout must be nonnegative")
+
+
+@dataclass
+class Trajectory:
+    task_id: str
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    final_answer: str | None = None
+    episode_status: str = "max_turns"
+    usage: dict[str, int] = field(
+        default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0}
+    )
+    error: str | None = None
+    meta: dict[str, Any] = field(default_factory=dict)
+    finish_reasons: dict[str, int] = field(default_factory=dict)
+    turns: int = 0
+    latency_sec: float = 0.0
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    runtime_latency_sec: float | None = None
+    finish_reason: str | None = None
+
+
+class ModelResponseError(ValueError):
+    """The model response violates the task's response contract."""
+
+
+async def react(
+    task: Task, ctx: Context, tools: ToolBox, *, trajectory: Trajectory | None = None, env: Env | None = None
+) -> Trajectory:
+    """Propagate runtime exceptions; run_episode owns normalization and persistence.
+
+    The optional record lets the outer wrapper retain a partially completed loop.
+    """
+    trace = trajectory if trajectory is not None else Trajectory(task.id)
+    trace.meta = copy.deepcopy(task.meta)
+    trace.messages = [{"role": "system", "content": task.system}, {"role": "user", "content": task.prompt}]
+    trace.tools = tools.schemas
+    for index in range(task.max_turns + 1):
+        final_turn = index == task.max_turns or (env is not None and env.terminal)
+        if final_turn and task.final_prompt is not None:
+            trace.messages.append({"role": "user", "content": task.final_prompt})
+        trace.turns += 1
+        turn = await call_model(ctx, trace.messages, None if final_turn else trace.tools)
+        trace.messages.append(turn.message())
+        trace.finish_reason = turn.finish_reason
+        for key, value in (turn.usage or {}).items():
+            trace.usage[key] = trace.usage.get(key, 0) + value
+        if turn.finish_reason is not None:
+            trace.finish_reasons[turn.finish_reason] = trace.finish_reasons.get(turn.finish_reason, 0) + 1
+        if turn.error is not None:
+            raise turn.error
+        if task.strict_response:
+            if turn.finish_reason in {"length", "max_tokens", "error", "aborted"}:
+                response_error_type = RuntimeError if turn.finish_reason in {"error", "aborted"} else ModelResponseError
+                raise response_error_type(f"Incomplete model response: {turn.finish_reason}")
+            if final_turn and turn.tool_calls:
+                raise ModelResponseError("Model attempted tools after the episode ended; these calls were not executed")
+            if not turn.tool_calls and not turn.content.strip():
+                raise ModelResponseError("Empty model response; no final text or executable tool calls")
+        if env is not None:
+            env.observe_turn(turn, index + 1)
+        if turn.tool_calls and not final_turn:
+            for call in turn.tool_calls:
+                started = time.perf_counter()
+                observation: dict[str, Any] = {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "tool_name": call["function"]["name"],
+                    "content": None,
+                }
+                try:
+                    response = await _call_tool(tools, env.prepare_tool_call(call) if env is not None else call)
+                    observation.update(content=response.content, is_error=response.is_error)
+                    if response.raw is not None:
+                        observation["tool_result"] = response.raw
+                    if response.fatal is not None:
+                        raise RuntimeError(response.fatal)
+                except BaseException as exc:
+                    observation.update(is_error=True, error=f"{type(exc).__name__}: {exc}")
+                    raise
+                finally:
+                    observation["latency_sec"] = round(time.perf_counter() - started, 6)
+                    trace.messages.append(observation)
+            continue
+        if turn.content.strip():
+            trace.final_answer = turn.content if task.strict_response else turn.content.strip()
+            trace.episode_status = "final_answer"
+            break
+        if trace.turns < task.max_turns:
+            trace.messages.append(
+                {"role": "user", "content": "Your reply was empty. Use a tool or provide the final answer."}
+            )
+    return trace
+
+
+async def run_episode(
+    task: Task, ctx: Context, tools: ToolBox, out: Path | None = None, *, env: Env | None = None
+) -> Trajectory:
+    trace = Trajectory(task.id)
+    started = time.perf_counter()
+    timeout = asyncio.timeout(task.timeout or None)
+    try:
+        async with timeout:
+            await react(task, ctx, tools, trajectory=trace, env=env)
+    except asyncio.CancelledError:
+        trace.episode_status, trace.error = "cancelled", "CancelledError"
+        raise
+    except ModelResponseError as exc:
+        trace.episode_status, trace.error = "invalid_response", f"{type(exc).__name__}: {exc}"
+    except TimeoutError as exc:
+        trace.episode_status = "timeout" if timeout.expired() else "error"
+        trace.error = f"task_timeout ({task.timeout}s)" if timeout.expired() else f"TimeoutError: {exc}"
+        _logger.error("Episode %s failed: %s", task.id, trace.error)
+    except Exception as exc:
+        trace.episode_status, trace.error = "error", f"{type(exc).__name__}: {exc}"
+        _logger.exception("Episode %s failed", task.id)
+    finally:
+        trace.latency_sec = round(time.perf_counter() - started, 3)
+        if out is not None:
+            save_trajectory(trace, out)
+    return trace
+
+
+async def _call_tool(tools: ToolBox, call: dict[str, Any]) -> ToolResponse:
+    try:
+        args = json.loads(call["function"]["arguments"] or "{}")
+    except json.JSONDecodeError:
+        return ToolResponse("Tool arguments must be a valid JSON object. Correct them and retry.", is_error=True)
+    if not isinstance(args, dict):
+        return ToolResponse("Tool arguments must be a JSON object. Correct them and retry.", is_error=True)
+    return await tools.call(call["function"]["name"], args)

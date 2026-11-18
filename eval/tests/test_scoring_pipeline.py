@@ -1,30 +1,35 @@
-"""Independent scoring, dataset provenance, and immutable inference evidence."""
+"""Independent scoring, saved task identities, and environment outputs."""
 
 import argparse
 import ast
 import asyncio
-import hashlib
+import contextlib
+import importlib
+import io
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from harness import Trajectory, save_trajectory
-from harness.model import AssistantTurn, Context, ModelParams
-
-from eval import scoring as eval_scoring
+from eval.agent import Trajectory
+from eval.benchmarks._common import resume
+from eval.benchmarks._common.metrics import ScoreRecord, ScoreResult, build_summary, collect_costs
+from eval.benchmarks._common.storage import save_environment_result, trajectory_path
 from eval.benchmarks.aime import scoring as aime
 from eval.benchmarks.browsecomp import scoring as browsecomp
-from eval.inference import _save_artifacts
-from eval.utils import trajectory_path
+from eval.benchmarks.gpqa import scoring as gpqa
+from eval.harness.utils import save_trajectory
+from eval.model import AssistantTurn, Context, ModelParams
 
 __all__ = []
 REPO = Path(__file__).resolve().parents[2]
 
 
-class ScoreArtifactTests(unittest.IsolatedAsyncioTestCase):
+class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -32,9 +37,22 @@ class ScoreArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.run_dir.mkdir()
         _write_run(self.run_dir)
 
-    async def test_repeated_scoring_keeps_previous_results_and_inference(self):
-        original = _inference_bytes(self.run_dir)
-        with patch.object(eval_scoring, "datetime") as clock:
+    async def test_previous_output_names_remain_readable_without_rewriting_rollout(self):
+        config_path = self.run_dir / "config.json"
+        config = json.loads(config_path.read_text())
+        config["collect_artifacts"] = config.pop("collect_environment_outputs")
+        config_path.write_text(json.dumps(config))
+        directory = self.run_dir / "environment_outputs"
+        (directory / "1/environment_result.json").rename(directory / "1/manifest.json")
+        directory.rename(self.run_dir / "artifacts")
+        original = _rollout_bytes(self.run_dir)
+        _, summary = await _run_score(_score_args(self.run_dir))
+        self.assertEqual((summary["score"], summary["sys_errors"]), (1.0, 0))
+        self.assertEqual(_rollout_bytes(self.run_dir), original)
+
+    async def test_repeated_scoring_keeps_previous_results_and_rollout(self):
+        original = _rollout_bytes(self.run_dir)
+        with patch.object(resume, "datetime") as clock:
             clock.now.return_value = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
             first, _ = await _run_score(_score_args(self.run_dir))
             first_bytes = {path.name: path.read_bytes() for path in first.iterdir()}
@@ -43,22 +61,26 @@ class ScoreArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(first.name, r"^\d{8}-\d{6}$")
         self.assertEqual(second.name, first.name + "-1")
         self.assertEqual({path.name: path.read_bytes() for path in first.iterdir()}, first_bytes)
-        self.assertEqual(_inference_bytes(self.run_dir), original)
+        self.assertEqual(_rollout_bytes(self.run_dir), original)
 
-    async def test_benchmark_owns_grading_policy_independently_of_inference_options(self):
+    async def test_benchmark_owns_grading_policy_independently_of_rollout_options(self):
         config_path = self.run_dir / "config.json"
         config = json.loads(config_path.read_text())
         config["scoring_method"] = "old_policy"
         config_path.write_text(json.dumps(config))
-        original = _inference_bytes(self.run_dir)
+        original = _rollout_bytes(self.run_dir)
         _, summary = await _run_score(_score_args(self.run_dir))
         self.assertEqual((summary["benchmark"], summary["score"], summary["sys_errors"]), ("aime", 1, 0))
-        self.assertEqual(_inference_bytes(self.run_dir), original)
+        self.assertEqual(_rollout_bytes(self.run_dir), original)
 
     async def test_wrong_benchmark_is_rejected_before_grading(self):
         evaluate = AsyncMock()
-        with self.assertRaisesRegex(ValueError, "Expected a"):
-            await _run_score(_score_args(self.run_dir), evaluate=evaluate, benchmark="gpqa")
+        with (
+            patch.object(gpqa, "load_tasks", side_effect=_load_tasks),
+            patch.object(gpqa, "score", evaluate),
+            self.assertRaisesRegex(ValueError, "Expected a"),
+        ):
+            await gpqa._run_score(_score_args(self.run_dir))
         evaluate.assert_not_awaited()
         self.assertFalse((self.run_dir / "scores").exists())
 
@@ -74,13 +96,10 @@ class ScoreArtifactTests(unittest.IsolatedAsyncioTestCase):
         build.assert_not_called()
         self.assertFalse((self.run_dir / "scores").exists())
 
-    async def test_dataset_change_is_rejected_before_grading(self):
+    async def test_scoring_loads_labels_from_the_configured_dataset(self):
         (self.run_dir.parent / "dataset.json").write_text('[{"id":"1","gold":43}]')
-        evaluate = AsyncMock()
-        with self.assertRaisesRegex(ValueError, "Dataset checksum"):
-            await _run_score(_score_args(self.run_dir), evaluate=evaluate)
-        evaluate.assert_not_awaited()
-        self.assertFalse((self.run_dir / "scores").exists())
+        _, summary = await _run_score(_score_args(self.run_dir))
+        self.assertEqual((summary["score"], summary["sys_errors"]), (0.0, 0))
 
     async def test_sample_selection_must_match_saved_ids(self):
         config_path = self.run_dir / "config.json"
@@ -96,28 +115,25 @@ class ScoreArtifactTests(unittest.IsolatedAsyncioTestCase):
             await _run_score(_score_args(self.run_dir))
 
     async def test_duplicate_samples_and_extra_trajectories_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "unique"):
-            await eval_scoring.run_score(
-                _score_args(self.run_dir),
-                lambda args: _load_tasks(args) * 2,
-                aime.score,
-                benchmark="aime",
-                method="integer",
-            )
+        with (
+            patch.object(aime, "load_tasks", side_effect=lambda args: _load_tasks(args) * 2),
+            self.assertRaisesRegex(ValueError, "unique"),
+        ):
+            await aime._run_score(_score_args(self.run_dir))
         save_trajectory(Trajectory("extra"), trajectory_path(self.run_dir, "extra"))
         with self.assertRaisesRegex(ValueError, "saved sample ids"):
             await _run_score(_score_args(self.run_dir))
 
-    async def test_scoring_cannot_overwrite_inference_artifacts(self):
-        original = _inference_bytes(self.run_dir)
+    async def test_scoring_cannot_overwrite_rollout_environment_outputs(self):
+        original = _rollout_bytes(self.run_dir)
         for output in (self.run_dir, self.run_dir.parent, self.run_dir / "trajectories/new"):
             with self.subTest(output=output), self.assertRaisesRegex(ValueError, "separate"):
                 await _run_score(_score_args(self.run_dir, output_dir=output))
-        self.assertEqual(_inference_bytes(self.run_dir), original)
+        self.assertEqual(_rollout_bytes(self.run_dir), original)
 
     async def test_judge_failure_is_scoring_only_and_keeps_agent_trace(self):
         _write_run(self.run_dir, benchmark="browsecomp")
-        original = _inference_bytes(self.run_dir)
+        original = _rollout_bytes(self.run_dir)
         client = MagicMock(close=AsyncMock())
         ctx = Context(client, ModelParams("judge", 0, 1, 1024, 42), asyncio.Semaphore(1))
         with (
@@ -126,13 +142,15 @@ class ScoreArtifactTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 browsecomp, "call_model", new_callable=AsyncMock, side_effect=RuntimeError("judge unavailable")
             ),
+            self.assertLogs("eval.benchmarks.browsecomp.scoring", level="ERROR") as logs,
         ):
             output, summary = await browsecomp._run_score(_score_args(self.run_dir))
         record = json.loads((output / "trajectories.json").read_text())[0]
         self.assertIsNone(record["agent_error"])
         self.assertEqual(record["score_result"]["sys_error"], "RuntimeError: judge unavailable")
+        self.assertIn("judge unavailable", "\n".join(logs.output))
         self.assertEqual((summary["agent_errors"], summary["scoring_errors"], summary["score"]), (0, 1, 0.0))
-        self.assertEqual(_inference_bytes(self.run_dir), original)
+        self.assertEqual(_rollout_bytes(self.run_dir), original)
         client.close.assert_awaited_once()
 
     async def test_failed_agent_keeps_denominator_and_separate_error(self):
@@ -149,53 +167,203 @@ class ScoreArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(record["score_result"]["score"], float)
         self.assertEqual((summary["num_tasks"], summary["agent_errors"], summary["scoring_errors"]), (1, 1, 0))
 
-    async def test_artifact_tampering_and_missing_files_are_rejected_before_scoring(self):
-        directory = self.run_dir / "artifacts/1"
+    async def test_missing_environment_output_files_are_rejected_before_scoring(self):
+        directory = self.run_dir / "environment_outputs/1"
         (directory / "evidence.txt").write_text("original")
-        _save_artifacts(directory, "1", {"file": "evidence.txt"}, None)
-        (directory / "evidence.txt").write_text("tampered")
+        save_environment_result(directory, "1", {"file": "evidence.txt"}, None)
         evaluate = AsyncMock()
-        with self.assertRaisesRegex(ValueError, "checksum"):
+        (directory / "evidence.txt").unlink()
+        with self.assertRaisesRegex(ValueError, "environment_result"):
             await _run_score(_score_args(self.run_dir), evaluate=evaluate)
         evaluate.assert_not_awaited()
         self.assertFalse((self.run_dir / "scores").exists())
-        (directory / "evidence.txt").unlink()
-        with self.assertRaisesRegex(ValueError, "manifest"):
-            await _run_score(_score_args(self.run_dir))
 
     async def test_incomplete_collection_requires_an_execution_error(self):
-        _save_artifacts(self.run_dir / "artifacts/1", "1", None, "collection failed")
+        save_environment_result(self.run_dir / "environment_outputs/1", "1", None, "collection failed")
         with self.assertRaisesRegex(ValueError, "incomplete collection"):
             await _run_score(_score_args(self.run_dir))
 
     async def test_hybrid_policy_combines_rule_and_judge_in_one_scoring_stage(self):
         ctx = Context(MagicMock(), ModelParams("judge", 0, 1, 1024, 42), asyncio.Semaphore(1))
+        orig_aime_score = aime.score
 
-        async def hybrid(sample, trace, artifacts, config):
-            rule = await aime.score(sample, trace, artifacts, config)
-            judged = await browsecomp.score(sample, trace, artifacts, config, ctx=ctx)
+        async def hybrid(sample, trace, environment_outputs, config):
+            rule = await orig_aime_score(sample, trace, environment_outputs, config)
+            judged = await browsecomp.score(sample, trace, environment_outputs, config, ctx=ctx)
             judged.method = "hybrid"
             judged.score = 0.4 * rule.score + 0.6 * judged.score
             return judged
 
         with patch.object(browsecomp, "call_model", return_value=AssistantTurn("correct: no")):
-            output, summary = await eval_scoring.run_score(
-                _score_args(self.run_dir), _load_tasks, hybrid, benchmark="aime", method="hybrid"
-            )
+            output, summary = await _run_score(_score_args(self.run_dir), evaluate=hybrid)
         record = json.loads((output / "trajectories.json").read_text())[0]["score_result"]
         self.assertEqual((summary["score"], record["method"]), (0.4, "hybrid"))
         self.assertEqual(len(record["messages"]), 2)
 
+    async def test_resume_scoring_skips_succeeded_and_retries_errors_and_missing(self):
+        dataset = self.run_dir.parent / "dataset.json"
+        samples = [
+            {"id": "1", "question": "Q1", "gold": 1, "meta": {}},
+            {"id": "2", "question": "Q2", "gold": 2, "meta": {}},
+            {"id": "3", "question": "Q3", "gold": 3, "meta": {}},
+        ]
+        dataset.write_text(json.dumps(samples))
+        (self.run_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "benchmark": "aime",
+                    "model": "model",
+                    "dataset_file": str(dataset),
+                    "sample_ids": ["1", "2", "3"],
+                    "collect_environment_outputs": False,
+                }
+            )
+        )
+        for sample in samples:
+            sample_id = str(sample["id"])
+            save_trajectory(
+                Trajectory(sample_id, final_answer=json.dumps({"answer": sample["gold"]})),
+                trajectory_path(self.run_dir, sample_id),
+            )
+        shutil.rmtree(self.run_dir / "environment_outputs", ignore_errors=True)
+
+        seen_first = []
+
+        async def first_eval(sample, trace, env_out, config):
+            seen_first.append(sample["id"])
+            if sample["id"] == "2":
+                raise RuntimeError("transient judge failure")
+            return ScoreResult(sample["gold"], sample["gold"], 1.0, "integer")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            score_dir, first_summary = await _run_score(_score_args(self.run_dir), evaluate=first_eval)
+        self.assertEqual(seen_first, ["1", "2", "3"])
+        self.assertEqual(first_summary["scoring_errors"], 1)
+
+        # Simulate sample "3" missing from trajectories.json (as if interrupted mid-scoring)
+        saved_records = json.loads((score_dir / "trajectories.json").read_text())
+        (score_dir / "trajectories.json").write_text(json.dumps([r for r in saved_records if r["task_id"] != "3"]))
+
+        seen_resume = []
+
+        async def resume_eval(sample, trace, env_out, config):
+            seen_resume.append(sample["id"])
+            return ScoreResult(sample["gold"], sample["gold"], 1.0, "integer")
+
+        resume_args = _score_args(None, resume=score_dir)
+        with contextlib.redirect_stdout(io.StringIO()):
+            resumed_dir, resumed_summary = await _run_score(resume_args, evaluate=resume_eval)
+
+        self.assertEqual(resumed_dir, score_dir)
+        self.assertEqual(sorted(seen_resume), ["2", "3"])
+        final_records = json.loads((score_dir / "trajectories.json").read_text())
+        self.assertEqual([r["task_id"] for r in final_records], ["1", "2", "3"])
+        self.assertEqual((resumed_summary["score"], resumed_summary["scoring_errors"]), (1.0, 0))
+        self.assertGreater(
+            resumed_summary["costs"]["scoring"]["time_sec"]["wall"],
+            first_summary["costs"]["scoring"]["time_sec"]["wall"],
+        )
+
+        # Resuming an already-complete score directory invokes evaluate zero times
+        no_eval = AsyncMock()
+        with contextlib.redirect_stdout(io.StringIO()):
+            await _run_score(_score_args(None, resume=score_dir), evaluate=no_eval)
+        no_eval.assert_not_awaited()
+
+    async def test_resume_scoring_rejects_mismatched_configs(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            score_dir, _ = await _run_score(_score_args(self.run_dir))
+
+        with self.assertRaisesRegex(ValueError, "combine"):
+            await _run_score(_score_args(self.run_dir, resume=score_dir, output_dir=self.run_dir / "scores/other"))
+        with self.assertRaisesRegex(ValueError, "score run"):
+            await gpqa._run_score(_score_args(None, resume=score_dir))
+        with self.assertRaisesRegex(ValueError, "scoring method"):
+            resume.init_score_dir(_score_args(None, resume=score_dir), _load_tasks, benchmark="aime", method="other")
+        with self.assertRaisesRegex(ValueError, "Source run"):
+            await _run_score(_score_args(self.run_dir.parent / "other-run", resume=score_dir))
+        with self.assertRaisesRegex(ValueError, "differs from saved config"):
+            await _run_score(_score_args(None, resume=score_dir, judge_model="other-judge"))
+        with self.assertRaisesRegex(ValueError, "differs from saved config"):
+            await _run_score(_score_args(None, resume=score_dir, seed=99))
+
+    def test_benchmark_parse_args_resume_scoring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            score_dir = run_dir / "scores" / "20261118-120000"
+            score_dir.mkdir(parents=True)
+            for name in ("aime", "browsecomp", "agent_abstain", "swe_bench"):
+                with self.subTest(benchmark=name):
+                    scorer = importlib.import_module(f"eval.benchmarks.{name}.scoring")
+                    saved = {
+                        "source_run_dir": str(run_dir.resolve()),
+                        "benchmark": name,
+                        "scoring_method": "m",
+                        "sample_concurrency": 3,
+                    }
+                    if name in ("browsecomp", "agent_abstain"):
+                        saved["judge_model"] = ["saved-judge"] if name == "agent_abstain" else "saved-judge"
+                        saved["judge_max_tokens"] = 4096
+                        saved["enable_thinking"] = False
+                        saved["reasoning_effort"] = "low"
+                        saved["concurrency"] = 2
+                        saved["timeout"] = 120.0
+                    if name == "swe_bench":
+                        saved["test_timeout"] = 900.0
+                    (score_dir / "config.json").write_text(json.dumps(saved))
+
+                    override_flags = ["--resume", str(score_dir), "--sample-concurrency", "5"]
+                    if name in ("browsecomp", "agent_abstain"):
+                        override_flags.extend(
+                            ["--concurrency", "8", "--timeout", "240", "--judge-base-url", "https://judge.new/v1"]
+                        )
+                    with patch.dict(os.environ, {}, clear=True), patch.object(scorer, "load_dotenv", create=True):
+                        resumed = scorer.parse_args(override_flags)
+                    self.assertEqual(Path(resumed.run_dir).resolve(), run_dir.resolve())
+                    self.assertEqual(resumed.sample_concurrency, 5)
+                    if name in ("browsecomp", "agent_abstain"):
+                        self.assertEqual(resumed.judge_model, saved["judge_model"])
+                        self.assertEqual((resumed.concurrency, resumed.timeout), (8, 240.0))
+                        self.assertEqual(resumed.judge_base_url, "https://judge.new/v1")
+                        self.assertFalse(resumed.enable_thinking)
+                    if name == "swe_bench":
+                        self.assertEqual(resumed.test_timeout, 900.0)
+
+                    if name == "browsecomp":
+                        for bad_flags in (
+                            ["--resume", str(score_dir), "--judge-model", "other-judge"],
+                            ["--resume", str(score_dir), "--judge-max-tokens", "2048"],
+                            ["--resume", str(score_dir), "--reasoning-effort", "high"],
+                        ):
+                            with (
+                                patch.dict(os.environ, {}, clear=True),
+                                patch.object(scorer, "load_dotenv"),
+                                contextlib.redirect_stderr(io.StringIO()),
+                                self.assertRaises(SystemExit),
+                            ):
+                                scorer.parse_args(bad_flags)
+                    if name == "swe_bench":
+                        with (
+                            patch.dict(os.environ, {}, clear=True),
+                            patch.object(scorer, "load_dotenv", create=True),
+                            contextlib.redirect_stderr(io.StringIO()),
+                            self.assertRaises(SystemExit),
+                        ):
+                            scorer.parse_args(["--resume", str(score_dir), "--test-timeout", "300"])
+                    with (
+                        patch.dict(os.environ, {}, clear=True),
+                        patch.object(scorer, "load_dotenv", create=True),
+                        contextlib.redirect_stderr(io.StringIO()),
+                        self.assertRaises(SystemExit),
+                    ):
+                        scorer.parse_args([str(Path(tmp) / "wrong-run"), "--resume", str(score_dir)])
+
     def test_summary_preserves_fractional_scores_and_separate_tool_errors(self):
         records = [
-            eval_scoring.ScoreRecord(
-                "1", eval_scoring.ScoreResult("a", "a", 0.375, "judge"), tool_errors=2, metadata={"level": 1}
-            ),
-            eval_scoring.ScoreRecord(
-                "2", eval_scoring.ScoreResult("a", None, 0.0, "judge"), agent_error="failed", metadata={"level": 2}
-            ),
+            ScoreRecord("1", ScoreResult("a", "a", 0.375, "judge"), tool_errors=2, metadata={"level": 1}),
+            ScoreRecord("2", ScoreResult("a", None, 0.0, "judge"), agent_error="failed", metadata={"level": 2}),
         ]
-        summary = eval_scoring.build_summary("test", records, "model", group_by=("level",))
+        summary = build_summary("test", records, "model", group_by=("level",))
         self.assertEqual((summary["correct"], summary["score"], summary["num_tasks"]), (0.375, 0.1875, 2))
         self.assertEqual((summary["sys_errors"], summary["tool_errors"]), (1, 2))
         self.assertEqual(summary["by_level"]["1"]["score"], 0.375)
@@ -239,35 +407,35 @@ class CostSummaryTests(unittest.TestCase):
             }
         ]
         records = [
-            eval_scoring.ScoreRecord(
+            ScoreRecord(
                 "one",
-                eval_scoring.ScoreResult("a", "a", 1.0, "judge"),
+                ScoreResult("a", "a", 1.0, "judge"),
                 metadata={"level": 1},
                 costs={
-                    "inference": eval_scoring._collect_costs(first, sample_sec=12, episode_sec=10),
-                    "scoring": eval_scoring._collect_costs(judge, sample_sec=4, episode_sec=4),
+                    "rollout": collect_costs(first, sample_sec=12, episode_sec=10),
+                    "scoring": collect_costs(judge, sample_sec=4, episode_sec=4),
                 },
             ),
-            eval_scoring.ScoreRecord(
+            ScoreRecord(
                 "two",
-                eval_scoring.ScoreResult("b", None, 0.0, "judge"),
+                ScoreResult("b", None, 0.0, "judge"),
                 agent_error="failed",
                 metadata={"level": 2},
                 costs={
-                    "inference": eval_scoring._collect_costs(second, sample_sec=6, episode_sec=5),
-                    "scoring": eval_scoring._collect_costs([], sample_sec=0, episode_sec=0),
+                    "rollout": collect_costs(second, sample_sec=6, episode_sec=5),
+                    "scoring": collect_costs([], sample_sec=0, episode_sec=0),
                 },
             ),
         ]
-        summary = eval_scoring.build_summary(
-            "fixture", records, "model", group_by=("level",), inference_wall_sec=12, scoring_wall_sec=4
+        summary = build_summary(
+            "fixture", records, "model", group_by=("level",), rollout_wall_sec=12, scoring_wall_sec=4
         )
-        inference, scoring, total = (summary["costs"][phase] for phase in ("inference", "scoring", "total"))
+        rollout, scoring, total = (summary["costs"][phase] for phase in ("rollout", "scoring", "total"))
         self.assertEqual(
             (
-                inference["tokens"]["prompt_tokens"],
-                inference["tokens"]["completion_tokens"],
-                inference["tokens"]["total_tokens"],
+                rollout["tokens"]["prompt_tokens"],
+                rollout["tokens"]["completion_tokens"],
+                rollout["tokens"]["total_tokens"],
             ),
             (35, 12, 47),
         )
@@ -290,18 +458,16 @@ class CostSummaryTests(unittest.TestCase):
             total["by_tool"]["search"],
             {"calls": 2, "errors": 1, "time_sec": 3, "mean_calls_per_task": 1, "mean_time_sec_per_call": 1.5},
         )
-        self.assertEqual(summary["by_level"]["2"]["costs"]["inference"]["tokens"]["total_tokens"], 7)
+        self.assertEqual(summary["by_level"]["2"]["costs"]["rollout"]["tokens"]["total_tokens"], 7)
 
     def test_missing_historical_timing_stays_unknown_and_usage_coverage_is_explicit(self):
-        cost = eval_scoring._collect_costs(
+        cost = collect_costs(
             [{"role": "assistant", "usage": None}, {"role": "tool", "tool_name": "search"}],
             sample_sec=None,
             episode_sec=5,
         )
-        record = eval_scoring.ScoreRecord(
-            "one", eval_scoring.ScoreResult("a", "a", 1.0, "rule"), costs={"inference": cost}
-        )
-        summary = eval_scoring.build_summary("fixture", [record], "model")["costs"]["inference"]
+        record = ScoreRecord("one", ScoreResult("a", "a", 1.0, "rule"), costs={"rollout": cost})
+        summary = build_summary("fixture", [record], "model")["costs"]["rollout"]
         self.assertEqual((summary["calls"]["model"], summary["calls"]["model_with_usage"]), (1, 0))
         self.assertIsNone(summary["time_sec"]["sample"])
         self.assertIsNone(summary["time_sec"]["model"])
@@ -310,27 +476,55 @@ class CostSummaryTests(unittest.TestCase):
 
 
 class DependencyBoundaryTests(unittest.TestCase):
-    def test_harness_imports_are_independent_of_eval(self):
-        for path in (REPO / "harness/src/harness").glob("*.py"):
+    def test_internal_modules_use_relative_imports_without_eval_prefix(self):
+        root = REPO / "eval/src/eval"
+        for path in root.rglob("*.py"):
+            if "data" in path.relative_to(root).parts:
+                continue
             for node in ast.walk(ast.parse(path.read_text())):
-                if isinstance(node, ast.ImportFrom):
-                    self.assertFalse((node.module or "").startswith("eval"), str(path))
+                if isinstance(node, ast.ImportFrom) and node.level == 0:
+                    module = node.module or ""
+                    self.assertFalse(module == "eval" or module.startswith("eval."), str(path))
                 elif isinstance(node, ast.Import):
-                    self.assertTrue(all(not alias.name.startswith("eval") for alias in node.names), str(path))
+                    for alias in node.names:
+                        self.assertFalse(alias.name == "eval" or alias.name.startswith("eval."), str(path))
 
-    def test_benchmark_imports_stay_inside_their_own_directory(self):
-        for path in (REPO / "eval/src/eval/benchmarks").glob("*/*.py"):
-            own_package = f"eval.benchmarks.{path.parent.name}"
+    def test_model_harness_agent_and_common_boundaries(self):
+        root = REPO / "eval/src/eval"
+        for path in (root / "model").glob("*.py"):
             for node in ast.walk(ast.parse(path.read_text())):
-                names = [node.module or ""] if isinstance(node, ast.ImportFrom) else []
-                if isinstance(node, ast.Import):
-                    names = [alias.name for alias in node.names]
-                for name in names:
-                    if name.startswith("eval.benchmarks."):
-                        self.assertTrue(name.startswith(own_package + "."), str(path))
+                if isinstance(node, ast.ImportFrom) and node.level >= 2:
+                    self.fail(f"{path} imports outside model/: {node.module}")
+        for path in (root / "harness").glob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.ImportFrom) and node.level >= 2:
+                    module = node.module or ""
+                    self.assertFalse(module.startswith("benchmarks"), str(path))
+        for node in ast.walk(ast.parse((root / "agent.py").read_text())):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                self.assertFalse(module.startswith("benchmarks"), "agent.py must not import benchmarks")
+        for path in (root / "benchmarks/_common").glob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.ImportFrom) and node.level >= 3:
+                    module = node.module or ""
+                    self.assertFalse(module.startswith(("model", "harness.env", "harness.tool")), str(path))
+                    if module == "agent":
+                        self.assertFalse(any(alias.name in ("react", "run_episode") for alias in node.names), str(path))
+
+    def test_benchmark_imports_stay_inside_their_own_directory_or_common(self):
+        root = REPO / "eval/src/eval/benchmarks"
+        for path in root.glob("*/*.py"):
+            own = path.parent.name
+            if own == "_common":
+                continue
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.ImportFrom) and node.level == 2:
+                    target = (node.module or "").split(".", 1)[0]
+                    self.assertIn(target, {"_common", own}, str(path))
 
     def test_agent_uses_only_the_borrowed_environment_interface(self):
-        tree = ast.parse((REPO / "harness/src/harness/agent.py").read_text())
+        tree = ast.parse((REPO / "eval/src/eval/agent.py").read_text())
         self.assertFalse(
             any(
                 isinstance(node, ast.AsyncWith)
@@ -349,8 +543,9 @@ class DependencyBoundaryTests(unittest.TestCase):
         )
 
 
-async def _run_score(args, *, evaluate=aime.score, benchmark="aime"):
-    return await eval_scoring.run_score(args, _load_tasks, evaluate, benchmark=benchmark, method="integer")
+async def _run_score(args, *, evaluate=aime.score):
+    with patch.object(aime, "load_tasks", side_effect=_load_tasks), patch.object(aime, "score", evaluate):
+        return await aime._run_score(args)
 
 
 def _load_tasks(args):
@@ -379,7 +574,7 @@ def _score_args(run_dir, **extra):
     )
 
 
-def _inference_bytes(run_dir):
+def _rollout_bytes(run_dir):
     return {
         str(path.relative_to(run_dir)): path.read_bytes()
         for path in run_dir.rglob("*")
@@ -396,14 +591,13 @@ def _write_run(run_dir, *, benchmark="aime"):
                 "benchmark": benchmark,
                 "model": "model",
                 "dataset_file": str(dataset),
-                "dataset_sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),
                 "sample_ids": ["1"],
-                "collect_artifacts": True,
+                "collect_environment_outputs": True,
             }
         )
     )
     save_trajectory(Trajectory("1", final_answer='{"answer":42}'), trajectory_path(run_dir, "1"))
-    _save_artifacts(run_dir / "artifacts/1", "1", None, None)
+    save_environment_result(run_dir / "environment_outputs/1", "1", None, None)
 
 
 if __name__ == "__main__":

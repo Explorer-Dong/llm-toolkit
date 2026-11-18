@@ -2,7 +2,6 @@
 
 import asyncio
 import contextlib
-import hashlib
 import importlib
 import io
 import itertools
@@ -15,11 +14,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from harness import agent, model
 from mcp.server.fastmcp import FastMCP
 
-from eval import inference as eval_inference
-from eval import scoring as eval_scoring
+from eval import agent
+from eval.benchmarks._common import cli
+from eval.model import openai as model
+from eval.model.utils import build_model_params
 
 __all__ = []
 BENCHMARKS = ("aime", "gpqa", "math", "gaia", "browsecomp", "webwalkerqa")
@@ -39,7 +39,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_each_benchmark_loads_self_contained_data_and_filters(self):
         for name in BENCHMARKS:
             with self.subTest(benchmark=name):
-                bench = importlib.import_module(f"eval.benchmarks.{name}.inference")
+                bench = importlib.import_module(f"eval.benchmarks.{name}.rollout")
                 args = _args(bench, ["--limit", "1"])
                 sample = bench.load_tasks(args)[0]
                 task = bench.build_task(sample, args)
@@ -48,9 +48,8 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertEqual(task.max_turns, 16 if name in WEB else 1)
                 altered = dict(sample, gold="SECRET_REFERENCE_SENTINEL")
                 self.assertNotIn("SECRET_REFERENCE_SENTINEL", str(bench.build_task(altered, args)))
-                module = importlib.import_module(f"eval.benchmarks.{name}.inference")
-                self.assertEqual(Path(module.DATA).parent.name, name)
-                self.assertTrue(any(Path(module.DATA).glob("*.json")))
+                self.assertEqual(Path(bench.DATA).parent.name, name)
+                self.assertTrue(any(Path(bench.DATA).glob("*.json")))
                 if name == "math":
                     args.subject, args.level = sample["subject"], sample["level"]
                 elif name == "gaia":
@@ -60,20 +59,20 @@ class BenchmarkTests(unittest.TestCase):
                 elif name == "webwalkerqa":
                     args.type, args.difficulty = sample["type"], sample["difficulty"]
                 self.assertEqual(bench.load_tasks(args)[0]["id"], sample["id"])
-        bench = importlib.import_module("eval.benchmarks.aime.inference")
+        bench = importlib.import_module("eval.benchmarks.aime.rollout")
         for year in (2024, 2025, 2026):
             self.assertTrue(bench.load_tasks(_args(bench, ["--year", str(year)])))
 
-    def test_generation_defaults_budget_alias_and_concurrency_controls(self):
+    def test_generation_defaults_turn_budget_and_concurrency_controls(self):
         for name in (*BENCHMARKS, "swe_bench"):
-            bench = importlib.import_module(f"eval.benchmarks.{name}.inference")
+            bench = importlib.import_module(f"eval.benchmarks.{name}.rollout")
             args = _args(bench)
             self.assertEqual(args.sample_concurrency, args.concurrency)
             self.assertFalse(hasattr(args, "judge_model"))
             self.assertTrue(args.enable_thinking)
             self.assertEqual(args.reasoning_effort, "medium")
-            selected = _args(bench, ["--disable-thinking", "--reasoning-effort", "high"])
-            params = model.build_model_params(selected)
+            selected = _args(bench, ["--no-enable-thinking", "--reasoning-effort", "high"])
+            params = build_model_params(selected)
             self.assertFalse(params.enable_thinking)
             self.assertEqual(params.reasoning_effort, "high")
             if name not in WEB and name != "swe_bench":
@@ -81,7 +80,7 @@ class BenchmarkTests(unittest.TestCase):
             args = _args(
                 bench,
                 [
-                    "--max-steps",
+                    "--max-turns",
                     "3",
                     "--top-k",
                     "0",
@@ -100,7 +99,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_common_provider_combinations_credentials_and_default_shared_server(self):
         for name, search, fetch in itertools.product(WEB, ("serper", "deepseek"), ("crawl4ai", "deepseek")):
-            bench = importlib.import_module(f"eval.benchmarks.{name}.inference")
+            bench = importlib.import_module(f"eval.benchmarks.{name}.rollout")
             args = _args(bench, ["--search-provider", search, "--fetch-provider", fetch])
             self.assertEqual((args.search_provider, args.fetch_provider), (search, fetch))
             self.assertEqual((args.ds_tool_key, args.serper_api_key), ("ds-secret", "serper-secret"))
@@ -109,20 +108,29 @@ class BenchmarkTests(unittest.TestCase):
                 patch.object(bench, "load_dotenv"),
                 patch.object(bench, "load_tasks", return_value=[]),
                 patch.object(bench, "common_server", wraps=bench.common_server) as server,
-                patch.object(eval_inference, "run_inference", new_callable=AsyncMock, return_value=[]) as execute,
+                patch.object(bench, "open_toolbox", wraps=bench.open_toolbox),
+                patch.object(bench, "run_rollout", new_callable=AsyncMock, return_value=[]),
             ):
                 self.assertEqual(bench.main(["--search-provider", search, "--fetch-provider", fetch]), 0)
-            config = server.call_args.args[0]
-            self.assertEqual((config.search_provider, config.fetch_provider), (search, fetch))
-            servers = execute.call_args.kwargs["shared_servers"]
-            self.assertEqual(len(servers), 1)
-            self.assertIsInstance(servers[0], FastMCP)
-            self.assertEqual(servers[0].name, "common")
+            with tempfile.TemporaryDirectory() as tmp:
+                run_args = _args(
+                    bench,
+                    ["--search-provider", search, "--fetch-provider", fetch, "--output-dir", str(Path(tmp) / "run")],
+                )
+                ctx = model.Context(MagicMock(close=AsyncMock()), PARAMS, asyncio.Semaphore(1))
+                with (
+                    patch.object(bench, "make_context", return_value=ctx),
+                    patch.object(bench, "common_server", return_value=FastMCP("common")) as server,
+                    patch.object(agent, "call_model", return_value=model.AssistantTurn("answer")),
+                ):
+                    asyncio.run(bench.run_rollout(run_args, [{"id": "1", "question": "Q", "gold": "A", "meta": {}}]))
+                config = server.call_args.args[0]
+                self.assertEqual((config.search_provider, config.fetch_provider), (search, fetch))
         for name in WEB:
             with self.subTest(benchmark=name):
-                args = _args(importlib.import_module(f"eval.benchmarks.{name}.inference"))
+                args = _args(importlib.import_module(f"eval.benchmarks.{name}.rollout"))
                 self.assertEqual((args.search_provider, args.fetch_provider), ("deepseek", "deepseek"))
-        args = _args(importlib.import_module("eval.benchmarks.gaia.inference"), ["--ds-tool-key", "override"])
+        args = _args(importlib.import_module("eval.benchmarks.gaia.rollout"), ["--ds-tool-key", "override"])
         self.assertEqual(args.ds_tool_key, "override")
 
     def test_invalid_limits_providers_and_names_are_rejected(self):
@@ -137,18 +145,18 @@ class BenchmarkTests(unittest.TestCase):
             ["--fetch-provider", "invalid"],
         ):
             with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                _args(importlib.import_module("eval.benchmarks.gaia.inference"), flags)
-        for entry, name in itertools.product((eval_inference, eval_scoring), ("../aime", "a.b", "AIME")):
+                _args(importlib.import_module("eval.benchmarks.gaia.rollout"), flags)
+        for entry, name in itertools.product((cli.rollout_main, cli.scoring_main), ("../aime", "a.b", "AIME")):
             with (
                 self.subTest(entry=entry.__name__, benchmark=name),
                 patch.object(sys, "argv", [entry.__name__, name]),
                 contextlib.redirect_stderr(io.StringIO()),
                 self.assertRaises(SystemExit),
             ):
-                entry.main()
+                entry()
 
     def test_benchmark_modules_and_stage_entrypoint_help(self):
-        for name, stage in itertools.product((*BENCHMARKS, "swe_bench"), ("inference", "scoring")):
+        for name, stage in itertools.product((*BENCHMARKS, "swe_bench"), ("rollout", "scoring")):
             with self.subTest(benchmark=name, stage=stage):
                 result = subprocess.run(
                     [sys.executable, "-m", f"eval.benchmarks.{name}.{stage}", "--help"],
@@ -160,9 +168,9 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertIn("--sample-concurrency", result.stdout)
                 if stage == "scoring":
                     self.assertEqual("--judge-model" in result.stdout, name in ("browsecomp", "webwalkerqa"))
-        for stage in ("inference", "scoring"):
+        for script in ("rollout", "scoring"):
             result = subprocess.run(
-                [sys.executable, "-m", f"eval.{stage}", "aime", "--help"],
+                [str(Path(sys.executable).parent / script), "aime", "--help"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -175,7 +183,7 @@ class PipelineSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def test_six_benchmarks_generate_then_score_from_original_datasets(self):
         for name in BENCHMARKS:
             with self.subTest(benchmark=name), tempfile.TemporaryDirectory() as tmp:
-                bench = importlib.import_module(f"eval.benchmarks.{name}.inference")
+                bench = importlib.import_module(f"eval.benchmarks.{name}.rollout")
                 grader = importlib.import_module(f"eval.benchmarks.{name}.scoring")
                 args = _args(bench, ["--limit", "1", "--output-dir", str(Path(tmp) / "run")])
                 sample = bench.load_tasks(args)[0]
@@ -187,35 +195,30 @@ class PipelineSmokeTests(unittest.IsolatedAsyncioTestCase):
                 if name == "math":
                     content = rf"\boxed{{{sample['gold']}}}"
                 ctx = model.Context(MagicMock(close=AsyncMock()), PARAMS, asyncio.Semaphore(1))
-                with (
-                    patch.object(eval_inference, "make_context", return_value=ctx) as inference_context,
-                    patch.object(agent, "call_model", return_value=model.AssistantTurn(content)) as call,
-                ):
-                    traces = await eval_inference.run_inference(
-                        args,
-                        [sample],
-                        [bench.build_task(sample, args)],
-                        shared_servers=[FastMCP("common")] if name in WEB else [],
+                with contextlib.ExitStack() as stack:
+                    rollout_context = stack.enter_context(patch.object(bench, "make_context", return_value=ctx))
+                    call = stack.enter_context(
+                        patch.object(agent, "call_model", return_value=model.AssistantTurn(content))
                     )
-                inference_context.assert_called_once()
+                    if name in WEB:
+                        stack.enter_context(patch.object(bench, "common_server", return_value=FastMCP("common")))
+                    traces = await bench.run_rollout(args, [sample])
+                rollout_context.assert_called_once()
                 self.assertEqual(call.await_count, 1)
                 self.assertIsNone(traces[0].error)
                 run_dir = Path(args.output_dir)
                 self.assertEqual({p.name for p in run_dir.iterdir()}, {"config.json", "trajectories"})
                 config = json.loads((run_dir / "config.json").read_text())
                 self.assertEqual(config["sample_ids"], [sample["id"]])
-                self.assertEqual(
-                    config["dataset_sha256"], hashlib.sha256(Path(args.dataset_file).read_bytes()).hexdigest()
-                )
-                before = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in run_dir.rglob("*") if p.is_file()}
+                before = {str(p): p.read_bytes() for p in run_dir.rglob("*") if p.is_file()}
                 judge_client = MagicMock(close=AsyncMock())
                 judge_ctx = model.Context(judge_client, PARAMS, asyncio.Semaphore(1))
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(
                         patch.object(
-                            eval_inference,
+                            bench,
                             "make_context",
-                            side_effect=AssertionError("Inference called during scoring"),
+                            side_effect=AssertionError("Rollout called during scoring"),
                         )
                     )
                     if name in ("browsecomp", "webwalkerqa"):
@@ -240,13 +243,13 @@ class PipelineSmokeTests(unittest.IsolatedAsyncioTestCase):
                 output = next((run_dir / "scores").iterdir())
                 summary = json.loads((output / "summary.json").read_text())
                 self.assertEqual((summary["num_tasks"], summary["correct"], summary["sys_errors"]), (1, 1, 0))
-                for path, digest in before.items():
-                    self.assertEqual(hashlib.sha256(Path(path).read_bytes()).hexdigest(), digest)
+                for path, contents in before.items():
+                    self.assertEqual(Path(path).read_bytes(), contents)
                 self.assertEqual(
                     {p.name for p in output.iterdir()}, {"config.json", "trajectories.json", "summary.json"}
                 )
                 score_config = json.loads((output / "config.json").read_text())
-                self.assertEqual(len(score_config["source_sha256"]), 2)
+                self.assertEqual(score_config["source_run_dir"], str(run_dir))
                 self.assertNotIn("judge_api_key", score_config)
                 if name in ("browsecomp", "webwalkerqa"):
                     build.assert_called_once()

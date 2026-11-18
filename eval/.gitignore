@@ -9,3 +9,4 @@ src/eval/benchmarks/*/data/downloads/
 src/eval/benchmarks/*/data/files/
 src/eval/benchmarks/*/data/*.parquet
 src/eval/benchmarks/*/data/*.arrow
+src/eval/benchmarks/webshop_abstain/data/catalogs/
