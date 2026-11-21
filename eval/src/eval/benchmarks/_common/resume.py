@@ -333,7 +333,10 @@ def finalize_rollout_dir(
     else:
         config["wall_time_sec"] = None
     write_json(run_dir / "config.json", config)
-    errors = sum(trace.error is not None and trace.episode_status != "invalid_response" for trace in traces)
+    errors = sum(
+        trace.error is not None and trace.episode_status not in {"invalid_response", "context_length_exceeded"}
+        for trace in traces
+    )
     print(f"Saved {len(traces)} trajectories; system errors: {errors}; output: {run_dir}")
     print(f"Score separately: scoring {benchmark} {run_dir}")
 

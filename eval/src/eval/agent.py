@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import APIStatusError, AsyncOpenAI
 
 from .harness.env import Env
 from .harness.tool import ToolBox, ToolResponse
@@ -17,6 +17,17 @@ from .model import call_model
 
 __all__ = ["Task", "Trajectory", "ModelResponseError", "react"]
 _logger = logging.getLogger(__name__)
+_CONTEXT_LENGTH_ERROR_CODES = frozenset({"context_length_exceeded"})
+_CONTEXT_LENGTH_ERROR_MARKERS = (
+    "context_length_exceeded",
+    "maximum context length",
+    "context length",
+    "context window",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "range of input length",
+)
 
 
 @dataclass(frozen=True)
@@ -152,11 +163,28 @@ async def react(
         trace.error = f"task_timeout ({task.timeout}s)" if timeout.expired() else f"TimeoutError: {exc}"
         _logger.error("Episode %s failed: %s", task.id, trace.error)
     except Exception as exc:
-        trace.episode_status, trace.error = "error", f"{type(exc).__name__}: {exc}"
-        _logger.exception("Episode %s failed", task.id)
+        trace.error = f"{type(exc).__name__}: {exc}"
+        if trace.turns > 1 and _is_context_length_error(exc):
+            trace.episode_status = "context_length_exceeded"
+        else:
+            trace.episode_status = "error"
+            _logger.exception("Episode %s failed", task.id)
     finally:
         trace.latency_sec = round(time.perf_counter() - episode_started, 3)
     return trace
+
+
+def _is_context_length_error(exc: BaseException) -> bool:
+    if not isinstance(exc, APIStatusError) or exc.status_code not in {400, 413, 422}:
+        return False
+    if exc.code in _CONTEXT_LENGTH_ERROR_CODES:
+        return True
+    if isinstance(exc.body, Mapping):
+        nested = exc.body.get("error")
+        if isinstance(nested, Mapping) and nested.get("code") in _CONTEXT_LENGTH_ERROR_CODES:
+            return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _CONTEXT_LENGTH_ERROR_MARKERS)
 
 
 async def _call_tool(tools: ToolBox, call: dict[str, Any]) -> ToolResponse:

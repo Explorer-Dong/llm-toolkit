@@ -10,6 +10,9 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+from openai import BadRequestError
+
 from eval import agent
 from eval.agent import Task, Trajectory, react
 from eval.harness.tool import Connection, ToolBox, ToolResponse
@@ -82,6 +85,62 @@ class ReactTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Endpoint unavailable", "\n".join(logs.output))
         self.assertEqual(result.error, "RuntimeError: Endpoint unavailable")
         self.assertEqual(load_trajectory(self.path), result)
+
+    async def test_context_length_bad_request_suppresses_logs_only_after_first_turn(self):
+        request = httpx.Request("POST", "https://model.example/v1/chat/completions")
+        response: Any = httpx.Response(400, request=request)
+        cases = (
+            {
+                "error": {
+                    "message": (
+                        "This model's maximum context length is 40960 tokens. However, you requested 16384 output "
+                        "tokens and your prompt contains at least 24577 input tokens."
+                    ),
+                    "type": "BadRequestError",
+                    "param": "input_tokens",
+                    "code": 400,
+                }
+            },
+            {"error": {"message": "Prompt limit reached.", "code": "context_length_exceeded"}},
+        )
+        first_turn = _reply("", calls=[_tool_call("search", '{"query":"q"}')], finish="tool_calls")
+        for body in cases:
+            exc = BadRequestError(f"Error code: 400 - {body}", response=response, body=body)
+            with (
+                self.subTest(turn=1, body=body),
+                self.assertLogs("eval.agent", level="ERROR") as logs,
+                patch.object(agent, "call_model", AsyncMock(return_value=AssistantTurn(error=exc))),
+            ):
+                result = await react(self.task, self.client, ToolBox(), PARAMS)
+            self.assertEqual(result.episode_status, "error")
+            self.assertIn("BadRequestError", "\n".join(logs.output))
+
+            with (
+                self.subTest(turn=2, body=body),
+                self.assertNoLogs("eval.agent", level="WARNING"),
+                patch.object(
+                    agent,
+                    "call_model",
+                    AsyncMock(side_effect=[first_turn, AssistantTurn(error=exc)]),
+                ),
+            ):
+                result = await react(self.task, self.client, self.tools, PARAMS)
+            self.assertEqual(result.episode_status, "context_length_exceeded")
+            self.assertEqual(result.turns, 2)
+            self.assertIn("BadRequestError", result.error or "")
+
+    async def test_non_context_bad_request_is_logged_as_system_error(self):
+        request = httpx.Request("POST", "https://model.example/v1/chat/completions")
+        response: Any = httpx.Response(400, request=request)
+        body = {"error": {"message": "Extra inputs are not permitted", "type": "BadRequestError", "code": 400}}
+        exc = BadRequestError(f"Error code: 400 - {body}", response=response, body=body)
+        with (
+            self.assertLogs("eval.agent", level="ERROR") as logs,
+            patch.object(agent, "call_model", AsyncMock(return_value=AssistantTurn(error=exc))),
+        ):
+            result = await react(self.task, self.client, ToolBox(), PARAMS)
+        self.assertEqual(result.episode_status, "error")
+        self.assertIn("Extra inputs are not permitted", "\n".join(logs.output))
 
     async def test_endpoint_finish_reason_and_local_status_remain_separate(self):
         for reason in ("stop", None, "provider_custom_value"):

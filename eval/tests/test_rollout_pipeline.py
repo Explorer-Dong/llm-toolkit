@@ -550,6 +550,27 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(config["wall_time_sec"], 1.5)
         self.assertNotIn("resume", config)
 
+    def test_finalize_rollout_dir_excludes_model_errors_from_system_errors(self):
+        self.run_dir.mkdir()
+        traces = [
+            Trajectory("0", final_answer="ok", episode_status="final_answer"),
+            Trajectory("1", episode_status="invalid_response", error="ModelResponseError: length"),
+            Trajectory("2", episode_status="context_length_exceeded", error="BadRequestError: maximum context length"),
+            Trajectory("3", episode_status="error", error="RuntimeError: endpoint down"),
+        ]
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            resume.finalize_rollout_dir(
+                self.run_dir,
+                {"benchmark": "aime"},
+                None,
+                started=0.0,
+                resumed_count=0,
+                benchmark="aime",
+                traces=traces,
+            )
+        self.assertIn("system errors: 1", stdout.getvalue())
+
     async def test_resume_all_complete_skips_model_and_server_setup(self):
         with (
             patch.object(gaia_rollout, "make_client", return_value=self.client),
