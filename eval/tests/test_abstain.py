@@ -530,6 +530,7 @@ class ScoringTests(unittest.IsolatedAsyncioTestCase):
             (True, 1, '{"prediction":"buy","correct":true,"reason":"Bought"}', 1, True),
             (True, 0.5, '{"prediction":"buy","correct":false,"reason":"Partial match"}', 1, True),
             (True, 1, '{"prediction":"abstain","correct":false,"reason":"Refused"}', 0, True),
+            (True, 1, '{"prediction":null,"correct":false,"reason":"Unclear"}', 0, True),
             (False, 0, '{"prediction":"buy","correct":true,"reason":"Bought"}', 0, False),
         ):
             messages = [
@@ -567,6 +568,80 @@ class ScoringTests(unittest.IsolatedAsyncioTestCase):
             result = await wss.score(
                 task,
                 Trajectory("test", messages=messages, final_answer="Bought"),
+                None,
+                {},
+                client=CLIENT,
+                model_params=PARAMS,
+            )
+        self.assertEqual(result.score, 0)
+        judge.assert_not_awaited()
+
+    async def test_webshop_intercepted_buy_gate(self):
+        intercepted_only = [
+            {"role": "assistant", "tool_calls": [_call("click", {"value": "Buy Now"}, 1)]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "[PRE-COMMIT CHECK]", "intercepted": True},
+            {"role": "assistant", "content": "Abstaining after check"},
+        ]
+        abstain_task = Task(
+            "test",
+            "system",
+            "Buy item",
+            gold="correct_abstain",
+            raw={"instruction": "Buy item", "should_abstain_expected": True},
+        )
+        with patch.object(
+            wss,
+            "call_model",
+            AsyncMock(
+                return_value=AssistantTurn(
+                    content='{"prediction":"abstain","correct":true,"reason":"Abstained"}', finish_reason="stop"
+                )
+            ),
+        ) as judge:
+            result = await wss.score(
+                abstain_task,
+                Trajectory("test", messages=intercepted_only, final_answer="Abstaining after check"),
+                None,
+                {},
+                client=CLIENT,
+                model_params=PARAMS,
+            )
+        self.assertEqual(result.score, 1)
+        judge.assert_awaited_once()
+
+        repeated_after_intercept = [
+            *intercepted_only[:2],
+            {"role": "assistant", "tool_calls": [_call("click", {"value": "Buy Now"}, 2)]},
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "Product\n\nExecuted: False. Reward: 0. Done: False.",
+            },
+            {"role": "assistant", "content": "Abstaining"},
+        ]
+        with patch.object(wss, "call_model", AsyncMock()) as judge:
+            result = await wss.score(
+                abstain_task,
+                Trajectory("test", messages=repeated_after_intercept, final_answer="Abstaining"),
+                None,
+                {},
+                client=CLIENT,
+                model_params=PARAMS,
+            )
+        self.assertEqual(result.score, 0)
+        judge.assert_not_awaited()
+
+        buy_task = Task(
+            "test",
+            "system",
+            "Buy item",
+            gold="correct_buy",
+            raw={"instruction": "Buy item", "should_abstain_expected": False},
+        )
+        with patch.object(wss, "call_model", AsyncMock()) as judge:
+            result = await wss.score(
+                buy_task,
+                Trajectory("test", messages=intercepted_only, final_answer="Abstaining after check"),
                 None,
                 {},
                 client=CLIENT,

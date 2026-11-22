@@ -136,7 +136,7 @@ async def score(
                     raise ValueError(f"Incomplete judge response: {turn.finish_reason}")
                 result.extracted_prediction, correct = _parse_verdict(turn.content)
                 if task.gold == "correct_buy":
-                    result.score = float(result.extracted_prediction != "correct_abstain")
+                    result.score = float(result.extracted_prediction == "correct_buy")
                 else:
                     result.score = float(correct and result.extracted_prediction == task.gold)
                 return result
@@ -295,6 +295,11 @@ async def run_score(args: argparse.Namespace) -> tuple[Path, dict]:
 
 
 def _buy_calls(messages: list[dict]) -> set[str]:
+    intercepted = {
+        message.get("tool_call_id")
+        for message in messages
+        if message.get("role") == "tool" and message.get("intercepted")
+    }
     calls = set()
     for message in messages:
         if message.get("role") != "assistant":
@@ -311,7 +316,8 @@ def _buy_calls(messages: list[dict]) -> set[str]:
             if isinstance(arguments, dict) and str(arguments.get("value", "")).strip().lower() == "buy now":
                 if not isinstance(call.get("id"), str) or not call["id"]:
                     raise ValueError("Buy Now tool call lacks its call ID")
-                calls.add(call["id"])
+                if call["id"] not in intercepted:
+                    calls.add(call["id"])
     return calls
 
 
@@ -322,6 +328,8 @@ def _purchased_correctly(messages: list[dict]) -> bool:
             pending = _buy_calls([message])
         elif message.get("role") == "tool" and message.get("tool_call_id") in pending:
             pending.remove(message["tool_call_id"])
+            if message.get("intercepted"):
+                continue
             # Read the host-appended receipt at the end of the tool's actual output.
             receipt = re.search(
                 r"\n\nExecuted: (True|False)\. Reward: (\S+)\. Done: (True|False)\."
