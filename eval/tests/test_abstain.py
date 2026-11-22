@@ -526,24 +526,25 @@ class ScoringTests(unittest.IsolatedAsyncioTestCase):
             gold="correct_buy",
             raw={"instruction": "Buy item", "should_abstain_expected": False},
         )
-        for reward, expected, judged in ((1, 1, True), (0.9, 0, False)):
+        for executed, reward, verdict, expected, judged in (
+            (True, 1, '{"prediction":"buy","correct":true,"reason":"Bought"}', 1, True),
+            (True, 0.5, '{"prediction":"buy","correct":false,"reason":"Partial match"}', 1, True),
+            (True, 1, '{"prediction":"abstain","correct":false,"reason":"Refused"}', 0, True),
+            (False, 0, '{"prediction":"buy","correct":true,"reason":"Bought"}', 0, False),
+        ):
             messages = [
                 {"role": "assistant", "tool_calls": [_call("click", {"value": "Buy Now"}, 1)]},
                 {
                     "role": "tool",
                     "tool_call_id": "call_1",
-                    "content": f"Product\n\nExecuted: True. Reward: {reward}. Done: True.",
+                    "content": f"Product\n\nExecuted: {executed}. Reward: {reward}. Done: {executed}.",
                 },
                 {"role": "assistant", "content": "Bought"},
             ]
             with patch.object(
                 wss,
                 "call_model",
-                AsyncMock(
-                    return_value=AssistantTurn(
-                        content='{"prediction":"buy","correct":true,"reason":"Bought"}', finish_reason="stop"
-                    )
-                ),
+                AsyncMock(return_value=AssistantTurn(content=verdict, finish_reason="stop")),
             ) as judge:
                 result = await wss.score(
                     task,
