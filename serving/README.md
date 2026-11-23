@@ -1,6 +1,6 @@
 # Model serving
 
-Serve models for high-performance inference.
+Serve models with engine for high-performance inference.
 
 ## Prepare model weights
 
@@ -59,10 +59,10 @@ zstd -dc sglang-v0.5.19-cu129.tar.zst | docker load
 ### Start inference engine
 
 ```bash
-export API_KEY=sk-vincent
-export MODEL_PATH=/data/dongwenjie/llm-toolkit/_models/Qwen3.5-9B
+export API_KEY=sk-xxx
+export MODEL_PATH=/path/to/Qwen3.5-9B
 export MODEL_FOLDER=Qwen3.5-9B
-export DOCKER_CONTAINER_NAME=local-qwen3.5-9b
+export DOCKER_CONTAINER_NAME=local_qwen3.5-9b
 export MODEL_NAME=Qwen3.5-9B
 export TOOL_CALL_PARSER=qwen3_coder
 export REASONING_PARSER=qwen3
@@ -120,14 +120,16 @@ docker run -d \
 
 > [!tip]
 >
-> Let agent help you setup binary is a good idea, as runtime-environment is very complex.
+> Remember, engine depends on torch and cuda, torch depend on cuda, and cuda depend on nvidia driver and glibc. We need to verify the highest supported cuda version on your nvidia driver and glibc, then install engine with targeted torch backend.
 
-Example installation for vLLM on `cu>=12.1,<13`:
+For example, we need to install vLLM on Ubuntu-22.04. First, check the nvidia driver version `570.xxx.xxx`, then check the glibc version `glibc=2.35`, the highest supported cuda version is `12.9`, so we should install vLLM with:
 
 ```bash
 uv venv --python 3.12
-uv pip install "vllm==0.30.0" --torch-backend=cu129
-uv pip install "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl"
+uv pip install "https://github.com/vllm-project/vllm/releases/download/v0.30.0/vllm-0.30.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl" --torch-backend=cu129
+
+# you can also persist the wheel, then
+uv pip install ./vllm-0.30.0+cu129-*.whl --torch-backend=cu129
 ```
 
 Verify installation:
@@ -157,7 +159,7 @@ vllm serve $MODEL_PATH \
   --host 0.0.0.0 \
   --port 8000 \
   --tensor-parallel-size 2 \
-  --gpu-memory-utilization 0.90 \
+  --gpu-memory-utilization 0.95 \
   --trust-remote-code \
   --tool-call-parser $TOOL_CALL_PARSER \
   --reasoning-parser $REASONING_PARSER
@@ -176,7 +178,7 @@ sglang serve \
   --tp-size 2 \
   --allow-auto-truncate \
   --dtype bfloat16 \
-  --mem-fraction-static 0.90 \
+  --mem-fraction-static 0.95 \
   --trust-remote-code \
   --tool-call-parser $TOOL_CALL_PARSER \
   --reasoning-parser $REASONING_PARSER
