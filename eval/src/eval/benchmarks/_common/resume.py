@@ -37,6 +37,7 @@ __all__ = [
 ]
 
 SECRET_KEYS = {"api_key", "serper_api_key", "crawl4ai_token", "ds_tool_key", "judge_api_key"}
+MODEL_NAMES = {"deepseek-flash": "deepseek-v4.1-flash-1017"}
 ROLLOUT_OVERRIDABLE = frozenset(
     {
         "base_url",
@@ -281,7 +282,7 @@ def init_rollout_dir(
         )
     else:
         timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-        model = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.model).lower()
+        model = re.sub(r"[^A-Za-z0-9_.-]+", "-", MODEL_NAMES.get(args.model, args.model)).lower()
         run_dir = (
             Path(args.output_dir).resolve() if args.output_dir else OUTPUT_DIR / args.benchmark / f"{model}_{timestamp}"
         )
@@ -290,6 +291,7 @@ def init_rollout_dir(
         else:
             run_dir = create_directory(run_dir)
     config = {key: value for key, value in vars(args).items() if key not in SECRET_KEYS and key != "resume"}
+    config["model"] = MODEL_NAMES.get(args.model, args.model)
     if saved_config is not None and "output_dir" in saved_config:
         config["output_dir"] = saved_config["output_dir"]
     config.update(
@@ -449,6 +451,11 @@ def init_score_dir(
             prev_wall = prev_summary.get("costs", {}).get("scoring", {}).get("time_sec", {}).get("wall")
 
     score_config = {key: value for key, value in vars(args).items() if key not in SECRET_KEYS and key != "resume"}
+    if "judge_model" in score_config:
+        judge = score_config["judge_model"]
+        score_config["judge_model"] = (
+            [MODEL_NAMES.get(m, m) for m in judge] if isinstance(judge, list) else MODEL_NAMES.get(judge, judge)
+        )
     if saved_score_config is not None and "output_dir" in saved_score_config:
         score_config["output_dir"] = saved_score_config["output_dir"]
     score_config.update(
@@ -503,7 +510,7 @@ def finalize_score_dir(
     summary = build_summary(
         benchmark,
         ordered,
-        rollout_config["model"],
+        MODEL_NAMES.get(rollout_config["model"], rollout_config["model"]),
         group_by=group_by,
         rollout_wall_sec=rollout_config.get("wall_time_sec"),
         scoring_wall_sec=scoring_wall_sec,

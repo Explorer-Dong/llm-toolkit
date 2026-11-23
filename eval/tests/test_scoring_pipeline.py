@@ -72,6 +72,18 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((summary["benchmark"], summary["score"], summary["sys_errors"]), ("aime", 1, 0))
         self.assertEqual(_rollout_bytes(self.run_dir), original)
 
+    async def test_deepseek_flash_requests_configured_name_and_persists_mapped_name(self):
+        _write_run(self.run_dir, benchmark="browsecomp")
+        client = MagicMock(close=AsyncMock())
+        with (
+            patch.object(browsecomp, "load_tasks", side_effect=_load_tasks),
+            patch.object(browsecomp, "make_client", return_value=client),
+            patch.object(browsecomp, "call_model", return_value=AssistantTurn("correct: yes")) as call,
+        ):
+            output, _ = await browsecomp.run_score(_score_args(self.run_dir, judge_model="deepseek-flash"))
+        self.assertEqual(call.call_args.kwargs["model"], "deepseek-flash")
+        self.assertEqual(json.loads((output / "config.json").read_text())["judge_model"], "deepseek-v4.1-flash-1017")
+
     async def test_wrong_benchmark_is_rejected_before_grading(self):
         evaluate = AsyncMock()
         with (

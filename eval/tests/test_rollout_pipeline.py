@@ -125,6 +125,22 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
         assert trace.runtime_latency_sec is not None
         self.assertGreaterEqual(trace.runtime_latency_sec, trace.latency_sec - 0.001)
 
+    async def test_deepseek_flash_requests_configured_name_and_persists_mapped_name(self):
+        self.args.output_dir = None
+        self.args.model = "deepseek-flash"
+        output = Path(self.temporary.name) / "outputs"
+        with (
+            patch.object(resume, "OUTPUT_DIR", output),
+            patch.object(aime_rollout, "make_client", return_value=self.client),
+            patch.object(agent, "call_model", return_value=AssistantTurn("answer")) as call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            await aime_rollout.rollout(self.args, self.tasks[:1])
+        run_dir = next((output / "aime").iterdir())
+        self.assertRegex(run_dir.name, r"^deepseek-v4\.1-flash-1017_\d{8}-\d{6}$")
+        self.assertEqual(call.call_args.kwargs["model"], "deepseek-flash")
+        self.assertEqual(json.loads((run_dir / "config.json").read_text())["model"], "deepseek-v4.1-flash-1017")
+
     async def test_envs_are_per_sample_and_collect_runs_before_teardown(self):
         self.args.benchmark = "swe_bench"
         events = []
