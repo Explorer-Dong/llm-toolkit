@@ -362,7 +362,7 @@ class WebShopEnv(Env):
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
     parser = argparse.ArgumentParser(description="WebShop Abstain")
-    add_model_args(parser, max_tokens=4096, timeout=90)
+    add_model_args(parser, max_tokens=4096, timeout=600)
     add_harness_args(parser, max_turns=30, concurrency=4)
     parser.set_defaults(
         benchmark="webshop_abstain",

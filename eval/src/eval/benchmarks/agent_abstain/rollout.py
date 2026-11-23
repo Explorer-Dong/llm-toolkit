@@ -107,7 +107,7 @@ class AgentAbstainEnv(Env):
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     load_dotenv(ROOT / ".env")
-    parser = argparse.ArgumentParser(description="AgentAbstain")
+    parser = argparse.ArgumentParser(description="Agent Abstain")
     add_model_args(parser, max_tokens=16384, timeout=600)
     add_harness_args(parser, max_turns=30, task_timeout=900, concurrency=4)
     parser.set_defaults(
