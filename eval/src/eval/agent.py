@@ -15,7 +15,7 @@ from .harness.env import Env
 from .harness.tool import ToolBox, ToolResponse
 from .model import call_model
 
-__all__ = ["Task", "Trajectory", "ModelResponseError", "react"]
+__all__ = ["TAIL_VERIFICATION", "Task", "Trajectory", "ModelResponseError", "react"]
 _logger = logging.getLogger(__name__)
 _CONTEXT_LENGTH_ERROR_CODES = frozenset({"context_length_exceeded"})
 _CONTEXT_LENGTH_ERROR_MARKERS = (
@@ -27,6 +27,16 @@ _CONTEXT_LENGTH_ERROR_MARKERS = (
     "input is too long",
     "too many tokens",
     "range of input length",
+)
+
+TAIL_VERIFICATION = (
+    "[Verification Check] Before your next action:\n"
+    "1. Check requirements: if the request relies on unstated personal preferences, has unresolved ambiguity, "
+    "or contains conflicting constraints that tools cannot resolve, stop calling tools and abstain now.\n"
+    "2. Check evidence: if tool outputs reveal contradictions, critical failures, emergent risks, "
+    "or only a partial match to the user's constraints, never guess defaults or settle for an approximate option—"
+    "keep searching if an exact match may still exist, or abstain and report the exact gap.\n"
+    "3. If all requirements are clear and verified, proceed with the task."
 )
 
 
@@ -97,12 +107,19 @@ async def react(
     try:
         async with timeout:
             trace.tools = tools.schemas
+            commit_intercepted = False
             for index in range(task.max_turns + 1):
                 final_turn = index == task.max_turns or (env is not None and env.terminal)
                 if final_turn and task.final_prompt is not None:
                     trace.messages.append({"role": "user", "content": task.final_prompt})
                 trace.turns += 1
-                turn = await call_model(client, trace.messages, None if final_turn else trace.tools, **model_params)
+                tail_prompt = getattr(env, "tail_verification", None)
+                request_messages = (
+                    _with_tail_verification(trace.messages, tail_prompt)
+                    if not final_turn and tail_prompt and not trace.messages[-1].get("intercepted")
+                    else trace.messages
+                )
+                turn = await call_model(client, request_messages, None if final_turn else trace.tools, **model_params)
                 trace.messages.append(turn.message())
                 trace.finish_reason = turn.finish_reason
                 for key, value in (turn.usage or {}).items():
@@ -126,6 +143,8 @@ async def react(
                 if env is not None:
                     env.observe_turn(turn, index + 1)
                 if turn.tool_calls and not final_turn:
+                    can_intercept = not commit_intercepted and index + 1 < task.max_turns and env is not None
+                    turn_intercepted = False
                     for call in turn.tool_calls:
                         tool_started = time.perf_counter()
                         observation: dict[str, Any] = {
@@ -135,18 +154,37 @@ async def react(
                             "content": None,
                         }
                         try:
-                            response = await _call_tool(tools, env.prepare_tool_call(call) if env is not None else call)
-                            observation.update(content=response.content, is_error=response.is_error)
-                            if response.raw is not None:
-                                observation["tool_result"] = response.raw
-                            if response.fatal is not None:
-                                raise RuntimeError(response.fatal)
+                            parsed_args = _parse_tool_args(call["function"]["arguments"])
+                            if can_intercept and (
+                                turn_intercepted
+                                or (
+                                    parsed_args is not None
+                                    and env.is_commit_call(call["function"]["name"], parsed_args)
+                                )
+                            ):
+                                turn_intercepted = True
+                                observation.update(
+                                    content=_pre_commit_prompt(call["function"]["name"], parsed_args or {}),
+                                    is_error=False,
+                                    intercepted=True,
+                                )
+                            else:
+                                response = await _call_tool(
+                                    tools, env.prepare_tool_call(call) if env is not None else call
+                                )
+                                observation.update(content=response.content, is_error=response.is_error)
+                                if response.raw is not None:
+                                    observation["tool_result"] = response.raw
+                                if response.fatal is not None:
+                                    raise RuntimeError(response.fatal)
                         except BaseException as exc:
                             observation.update(is_error=True, error=f"{type(exc).__name__}: {exc}")
                             raise
                         finally:
                             observation["latency_sec"] = round(time.perf_counter() - tool_started, 6)
                             trace.messages.append(observation)
+                    if turn_intercepted:
+                        commit_intercepted = True
                     continue
                 if turn.content.strip():
                     trace.final_answer = turn.content if task.strict_response else turn.content.strip()
@@ -195,3 +233,33 @@ async def _call_tool(tools: ToolBox, call: dict[str, Any]) -> ToolResponse:
     if not isinstance(args, dict):
         return ToolResponse("Tool arguments must be a JSON object. Correct them and retry.", is_error=True)
     return await tools.call(call["function"]["name"], args)
+
+
+def _with_tail_verification(messages: list[dict[str, Any]], tail_prompt: str) -> list[dict[str, Any]]:
+    last = messages[-1]
+    content = last.get("content") or ""
+    return [*messages[:-1], {**last, "content": f"{content}\n\n{tail_prompt}" if content else tail_prompt}]
+
+
+def _parse_tool_args(raw_arguments: str | None) -> dict[str, Any] | None:
+    try:
+        args = json.loads(raw_arguments or "{}")
+    except json.JSONDecodeError:
+        return None
+    return args if isinstance(args, dict) else None
+
+
+def _pre_commit_prompt(name: str, arguments: dict[str, Any]) -> str:
+    return (
+        f"[PRE-COMMIT CHECK] Execution of `{name}` with arguments "
+        f"`{json.dumps(arguments, ensure_ascii=False)}` is paused for a one-time verification.\n"
+        "Before confirming this consequential action, audit your decision against the user's request "
+        "and all observations so far:\n"
+        "1. No unverified assumptions: Did you guess any default for a missing parameter, "
+        "subjective preference, or ambiguous instruction?\n"
+        "2. Strict constraint & evidence match: Does the target satisfy 100% of the user's constraints "
+        "without conflicts, discrepancies, or emergent risks in the tool outputs?\n"
+        "If every requirement is strictly verified, repeat this tool call in your next turn to execute it. "
+        "If any gap, conflict, or uncertainty exists, do not repeat this call—"
+        "either continue read-only exploration or stop calling tools and abstain."
+    )

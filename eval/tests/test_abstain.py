@@ -481,14 +481,18 @@ class WebShopEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sequential_calls_stop_on_buy_and_request_final_without_tools(self):
         env, task = _shop_env(turns=5)
-        calls = [
+        first_calls = [
             _call("search", {"keywords": "item"}, 1),
             _call("click", {"value": "P1"}, 2),
             _call("click", {"value": "Buy Now"}, 3),
-            _call("search", {"keywords": "later"}, 4),
+        ]
+        confirm_calls = [
+            _call("click", {"value": "Buy Now"}, 4),
+            _call("search", {"keywords": "later"}, 5),
         ]
         turns = [
-            AssistantTurn(tool_calls=calls, finish_reason="tool_calls"),
+            AssistantTurn(tool_calls=first_calls, finish_reason="tool_calls"),
+            AssistantTurn(tool_calls=confirm_calls, finish_reason="tool_calls"),
             AssistantTurn(content="Bought", finish_reason="stop"),
         ]
         with patch.object(agent, "call_model", AsyncMock(side_effect=turns)) as model:
@@ -496,11 +500,52 @@ class WebShopEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 trace = await react(task, CLIENT, tools, PARAMS, env=env)
         self.assertIsNone(trace.error)
         self.assertEqual(env.environment.actions, ["search[item]", "click[P1]", "click[Buy Now]"])
-        self.assertEqual(trace.turns, 2)
+        self.assertEqual(trace.turns, 3)
         self.assertTrue(wss._purchased_correctly(trace.messages))
+        self.assertTrue(trace.messages[5]["intercepted"])
+        self.assertIn("[PRE-COMMIT CHECK]", trace.messages[5]["content"])
         self.assertIn("skipped_tool_call[search]", trace.messages[-2]["content"])
         self.assertIsNone(model.call_args.args[2])
         self.assertEqual(sum(message["role"] == "user" for message in trace.messages), 1)
+
+    async def test_pincer_tail_verification_and_pre_commit_single_intercept(self):
+        args = aa.parse_args(["--model", "test", "--category", "high_stakes_action", "--task-type", "abstain"])
+        task = next(t for t in aa.load_tasks(args) if t.meta["action_type"] == "operational")
+        crit_tool = task.meta["critical_actions"][0]
+        seen_tail = []
+        lookup_tool = ""
+
+        async def fake_model(_client, messages, _tools, **_kwargs):
+            seen_tail.append(messages[-1]["content"])
+            if len(seen_tail) == 1:
+                return AssistantTurn(
+                    tool_calls=[
+                        _call(lookup_tool.replace(".", "_"), {}, 1),
+                        _call(crit_tool.replace(".", "_"), {}, 2),
+                    ],
+                    finish_reason="tool_calls",
+                )
+            return AssistantTurn(content="Abstaining after pre-commit check", finish_reason="stop")
+
+        with patch.object(agent, "call_model", AsyncMock(side_effect=fake_model)):
+            async with aa.AgentAbstainEnv(task) as env, open_toolbox(env_server(env)) as tools:
+                lookup_tool = next(
+                    tool.name
+                    for tool in await env.list_tools()
+                    if env.environment.tool_kinds.get(tool.name) in {"lookup", "verify"}
+                )
+                self.assertFalse(env.is_commit_call(lookup_tool.replace(".", "_"), {}))
+                self.assertTrue(env.is_commit_call(crit_tool.replace(".", "_"), {}))
+                trace = await react(task, CLIENT, tools, PARAMS, env=env)
+                executed = {entry["tool"] for entry in env.export()["execution_log"]}
+        self.assertIn(agent.TAIL_VERIFICATION, seen_tail[0])
+        self.assertNotIn(agent.TAIL_VERIFICATION, trace.messages[1]["content"])
+        self.assertIn("[PRE-COMMIT CHECK]", seen_tail[1])
+        self.assertNotIn(agent.TAIL_VERIFICATION, seen_tail[1])
+        self.assertNotIn(crit_tool, executed)
+        tool_obs = [m for m in trace.messages if m["role"] == "tool"]
+        self.assertFalse(tool_obs[0].get("intercepted", False))
+        self.assertTrue(tool_obs[1].get("intercepted", False))
 
     async def test_budget_and_invalid_calls_preserve_observation_receipts(self):
         env, task = _shop_env(turns=1)

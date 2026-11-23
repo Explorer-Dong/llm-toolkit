@@ -94,12 +94,14 @@ class BenchmarkMCPTests(unittest.TestCase):
                 self,
                 "webshop_abstain",
                 [_call("search", {"keywords": "fixture product"}), _call("click", {"value": "Buy Now"})],
+                confirm_calls=[_call("click", {"value": "Buy Now"})],
             )
         self.assertEqual(trace.tools, bench.FIRST_TURN_TOOLS)
         self.assertEqual(
             [call.args for call in shop.step.call_args_list], [("search[fixture product]",), ("click[Buy Now]",)]
         )
         outputs = [message for message in trace.messages if message["role"] == "tool"]
+        self.assertTrue(outputs[1].get("intercepted"))
         self.assertIn("Executed: True. Reward: 1. Done: True.", outputs[-1]["content"])
         shop.close.assert_called_once()
 
@@ -112,7 +114,7 @@ def _check_web_tools(test, benchmark):
     test.assertEqual({tool["function"]["name"] for tool in trace.tools}, {"search", "fetch"})
 
 
-def _run_benchmark(test, benchmark, calls):
+def _run_benchmark(test, benchmark, calls, *, confirm_calls=()):
     bench = importlib.import_module(f"eval.benchmarks.{benchmark}.rollout")
     requests = []
     send_request = ClientSession.send_request
@@ -129,6 +131,11 @@ def _run_benchmark(test, benchmark, calls):
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(side_effect=close_client)
     turns = [AssistantTurn(content="Completed", finish_reason="stop")]
+    if confirm_calls:
+        turns.insert(
+            0,
+            AssistantTurn(tool_calls=[dict(call, id=f"confirm_{index}") for index, call in enumerate(confirm_calls)]),
+        )
     if calls:
         turns.insert(0, AssistantTurn(tool_calls=[dict(call, id=f"call_{index}") for index, call in enumerate(calls)]))
     with (
@@ -142,7 +149,8 @@ def _run_benchmark(test, benchmark, calls):
         asyncio.run(bench.rollout(run_args, bench.load_tasks(run_args)))
         trace = load_trajectory(next((output / "trajectories").glob("*.json")))
         test.assertIsNone(trace.error)
-        test.assertEqual(model.await_count, 2 if calls else 1)
+        expected_turns = 1 + int(bool(calls)) + int(bool(confirm_calls))
+        test.assertEqual(model.await_count, expected_turns)
         if benchmark == "agent_abstain":
             evidence = json.loads(next((output / "environment_outputs").glob("*/environment_result.json")).read_text())
             test.assertEqual(len(evidence["data"]["execution_log"]), len(calls))
@@ -152,7 +160,7 @@ def _run_benchmark(test, benchmark, calls):
         [request["method"] for request in requests],
         ["initialize", "tools/list", *["tools/call" for _ in calls]] if calls else [],
     )
-    outputs = [message for message in trace.messages if message["role"] == "tool"]
+    outputs = [message for message in trace.messages if message["role"] == "tool" and not message.get("intercepted")]
     test.assertEqual(len(outputs), len(calls))
     for output in outputs:
         test.assertFalse(output["is_error"])

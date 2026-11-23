@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 from mcp.types import CallToolResult, TextContent, Tool
 
 from ... import ROOT
-from ...agent import Task, Trajectory, react
+from ...agent import TAIL_VERIFICATION, Task, Trajectory, react
 from ...harness import add_harness_args
 from ...harness.env import Env
 from ...harness.tool import env_server, open_toolbox
@@ -339,6 +339,7 @@ class WebShopEnv(Env):
     caps = frozenset({"tools"})
     # Invalid actions use the original WebShop observations and host receipts.
     validate_tool_arguments = False
+    tail_verification = TAIL_VERIFICATION
 
     def __init__(self, task: Task, catalog: WebShopCatalog) -> None:
         self.task = task
@@ -406,6 +407,16 @@ class WebShopEnv(Env):
         if classification["invalid"]:
             return {**call, "function": {"name": "search", "arguments": json.dumps({"_invalid": classification})}}
         return call
+
+    def is_commit_call(self, name: str, arguments: dict[str, Any]) -> bool:
+        if self.terminal or self.environment is None:
+            return False
+        classification = _classify_tool_call(
+            [{"function": {"name": name, "arguments": arguments}}],
+            self.environment.get_available_actions(),
+        )
+        action = _normalize_action(classification)
+        return action is not None and action.lower() == "click[buy now]"
 
     async def list_tools(self) -> list[Tool]:
         return [

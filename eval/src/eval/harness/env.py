@@ -32,6 +32,7 @@ class Env:
     caps: frozenset[str] = frozenset()
     terminal: bool = False
     validate_tool_arguments: bool = True
+    tail_verification: str | None = None
 
     async def prepare_task(self, task: Task) -> Task:
         return task
@@ -41,6 +42,9 @@ class Env:
 
     def prepare_tool_call(self, call: dict[str, Any]) -> dict[str, Any]:
         return call
+
+    def is_commit_call(self, name: str, arguments: dict[str, Any]) -> bool:
+        return False
 
     async def list_tools(self) -> list[Tool]:
         return []

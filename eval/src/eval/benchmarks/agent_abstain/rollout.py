@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from mcp.types import CallToolResult, TextContent, Tool
 
 from ... import ROOT
-from ...agent import Task, Trajectory, react
+from ...agent import TAIL_VERIFICATION, Task, Trajectory, react
 from ...harness import add_harness_args
 from ...harness.env import Env
 from ...harness.tool import env_server, open_toolbox
@@ -51,6 +51,7 @@ SCENARIOS = (
 
 class AgentAbstainEnv(Env):
     caps = frozenset({"tools"})
+    tail_verification = TAIL_VERIFICATION
 
     def __init__(self, task: Task) -> None:
         self.task = task
@@ -77,6 +78,16 @@ class AgentAbstainEnv(Env):
 
     async def teardown(self) -> None:
         self.environment = None
+
+    def is_commit_call(self, name: str, arguments: dict[str, Any]) -> bool:
+        if self.environment is None:
+            return False
+        kinds = getattr(self.environment, "tool_kinds", None)
+        if not isinstance(kinds, dict):
+            return False
+        return kinds.get(name) == "commit" or any(
+            kind == "commit" and tool.replace(".", "_") == name for tool, kind in kinds.items()
+        )
 
     async def list_tools(self) -> list[Tool]:
         tools = await self.environment.mcp.list_tools()
