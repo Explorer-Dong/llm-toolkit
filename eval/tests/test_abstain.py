@@ -354,9 +354,15 @@ class WebShopEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((restored.st_dev, restored.st_ino), (original.st_dev, original.st_ino))
 
     async def test_catalog_switch_waits_for_sessions_and_releases_previous_library(self):
+        import gc
+
+        gc.unfreeze()
+        gc.collect()
+        baseline = gc.get_freeze_count()
         catalog = ws.WebShopCatalog(ws.DATA / "catalogs")
         with patch.object(catalog, "_bootstrap", side_effect=[MagicMock(), MagicMock()]) as bootstrap:
             first = await catalog.get_server("full")
+            self.assertGreater(gc.get_freeze_count(), baseline)
             self.assertIs(await catalog.get_server("full"), first)
             pending = asyncio.create_task(catalog.get_server("pruned_missing_target_251"))
             await asyncio.sleep(0)
@@ -367,10 +373,12 @@ class WebShopEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             await catalog.release_server()
             await asyncio.wait_for(pending, 5)
             self.assertEqual(set(catalog.servers), {"pruned_missing_target_251"})
+            self.assertGreater(gc.get_freeze_count(), baseline)
             self.assertEqual(bootstrap.call_count, 2)
             await catalog.release_server()
             self.assertEqual(catalog.active_sessions, 0)
         catalog.close()
+        self.assertEqual(gc.get_freeze_count(), baseline)
 
     async def test_sequential_calls_stop_on_buy_and_request_final_without_tools(self):
         env, task = _shop_env(turns=5)

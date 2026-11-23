@@ -148,9 +148,10 @@ class WebShopCatalog:
         async with self.condition:
             await self.condition.wait_for(lambda: variant in self.servers or self.active_sessions == 0)
             if variant not in self.servers:
-                self.servers.clear()
-                gc.collect()
+                self.close()
                 self.servers[variant] = await asyncio.to_thread(self._bootstrap, variant)
+                gc.collect()
+                gc.freeze()
             self.active_sessions += 1
             return self.servers[variant]
 
@@ -167,9 +168,13 @@ class WebShopCatalog:
         return self.reset_indices[int(base) if base is not None else self.goal_indices[str(record["source_id"])]]
 
     def close(self) -> None:
+        if not self.servers:
+            return
         for server in self.servers.values():
             server.user_sessions.clear()
         self.servers.clear()
+        gc.unfreeze()
+        gc.collect()
 
     def _bootstrap(self, variant: str):
         java = self.java_home or os.getenv("JAVA_HOME")
