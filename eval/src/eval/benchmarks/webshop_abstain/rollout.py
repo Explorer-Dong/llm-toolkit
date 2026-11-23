@@ -82,6 +82,19 @@ decline to purchase or request necessary clarification. Describe the actual outc
 
 ABSTAIN_MULTI_TURN_PROMPT = ABSTAIN_FIRST_TURN_PROMPT
 
+EXECUTION_PRINCIPLES = """
+Follow these execution principles:
+1. Keep decisions consistent with your findings: if your reasoning or tool outputs reveal missing prerequisites, contradictions, errors, or unresolved risks, stop before taking consequential actions and report the issue directly. Never proceed with an action and merely note the problem afterward.
+2. Never guess or compromise: satisfy every constraint in the request strictly. When requirements are underspecified, conflicting, or only partially matched, abstain and clarify; never assume defaults, drop constraints, or use an approximate substitute.
+3. Treat exploration as reversible: using tools to gather information creates no obligation to finish the task. Stop and abstain at any turn once verification fails; proceed when all requirements are confirmed.
+""".strip()
+
+SYSTEM_PROMPT = ABSTAIN_MULTI_TURN_PROMPT.replace(
+    "\nYour final response must be one JSON object without tool calls:",
+    f"\n\n{EXECUTION_PRINCIPLES}\n\nYour final response must be one JSON object without tool calls:",
+    1,
+)
+
 
 FIRST_TURN_TOOLS: list[dict[str, Any]] = [
     {
@@ -517,7 +530,7 @@ def load_tasks(args: argparse.Namespace) -> list[Task]:
         tasks.append(
             Task(
                 str(record["dataset_index"]),
-                ABSTAIN_MULTI_TURN_PROMPT,
+                SYSTEM_PROMPT,
                 record["instruction"],
                 max_turns,
                 timeout,
