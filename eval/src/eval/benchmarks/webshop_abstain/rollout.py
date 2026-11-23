@@ -3,19 +3,25 @@
 import argparse
 import asyncio
 import copy
+import fcntl
 import gc
 import json
 import logging
 import os
 import random
+import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
 import warnings
-from collections.abc import Sequence
+import zlib
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
+from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +42,7 @@ from .._common.tasks import run_tasks
 __all__ = ["WebShopCatalog", "WebShopEnv", "parse_args", "load_tasks", "rollout"]
 DATA = Path(__file__).parent / "data"
 DATA_FILE = "webshop_abstain.json"
+CATALOG_CACHE_FILE = "catalog.sqlite3"
 _logger = logging.getLogger(__name__)
 _DEPENDENCY_WARNINGS = (
     (r"Importing 'parser\.split_arg_string' is deprecated", DeprecationWarning, r"spacy\.cli\._util"),
@@ -130,6 +137,73 @@ GROUPS = {
 }
 
 
+class _CatalogStore(Mapping[str, dict[str, Any]]):
+    """Read-only SQLite product store with an in-memory LRU cache."""
+
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+        self._conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
+        self._load_entry = lru_cache(maxsize=512)(self._fetch_entry)
+        self.prices = _CatalogPrices(self)
+
+    def _fetch_entry(self, asin: str) -> tuple[float, bytes] | None:
+        row = self._conn.execute("SELECT price, data FROM products WHERE asin = ?", (asin,)).fetchone()
+        return (float(row[0]), bytes(row[1])) if row is not None else None
+
+    def __getitem__(self, asin: str) -> dict[str, Any]:
+        entry = self._load_entry(asin)
+        if entry is None:
+            raise KeyError(asin)
+        return json.loads(zlib.decompress(entry[1]))
+
+    def __contains__(self, asin: object) -> bool:
+        return isinstance(asin, str) and self._load_entry(asin) is not None
+
+    def __iter__(self) -> Iterator[str]:
+        return (row[0] for row in self._conn.execute("SELECT asin FROM products"))
+
+    def __len__(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) FROM products").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def price(self, asin: str) -> float:
+        entry = self._load_entry(asin)
+        if entry is None:
+            raise KeyError(asin)
+        return entry[0]
+
+    def fingerprint(self) -> str | None:
+        row = self._conn.execute("SELECT value FROM meta WHERE key = 'fingerprint'").fetchone()
+        return bytes(row[0]).decode("utf-8") if row is not None else None
+
+    def load_goals(self) -> list[dict[str, Any]]:
+        row = self._conn.execute("SELECT value FROM meta WHERE key = 'goals'").fetchone()
+        if row is None:
+            raise RuntimeError(f"Missing goals metadata in {self.db_path}")
+        return json.loads(zlib.decompress(row[0]))
+
+    def close(self) -> None:
+        self._load_entry.cache_clear()
+        self._conn.close()
+
+
+class _CatalogPrices(Mapping[str, float]):
+    def __init__(self, store: _CatalogStore) -> None:
+        self._store = store
+
+    def __getitem__(self, asin: str) -> float:
+        return self._store.price(asin)
+
+    def __contains__(self, asin: object) -> bool:
+        return asin in self._store
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._store)
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
 class WebShopCatalog:
     """Share immutable product libraries; each episode owns its sessions."""
 
@@ -172,6 +246,8 @@ class WebShopCatalog:
             return
         for server in self.servers.values():
             server.user_sessions.clear()
+            if isinstance(getattr(server, "product_item_dict", None), _CatalogStore):
+                server.product_item_dict.close()
         self.servers.clear()
         gc.unfreeze()
         gc.collect()
@@ -194,7 +270,7 @@ class WebShopCatalog:
             for message, category, module in _DEPENDENCY_WARNINGS:
                 warnings.filterwarnings("ignore", message=message, category=category, module=module)
             from .data.text_environment import utils
-            from .data.text_environment.engine import engine
+            from .data.text_environment.engine import engine, goal
             from .data.text_environment.envs import web_agent_text_env
         from jnius import autoclass
 
@@ -215,6 +291,8 @@ class WebShopCatalog:
             if not path.exists():
                 raise FileNotFoundError(f"Missing WebShop catalog file: {path}; see data/README.md")
 
+        store = _open_catalog_store(products, attributes, instructions, engine, goal)
+
         def init_search_engine(num_products=None):
             indexes = {
                 100: "search_index_100",
@@ -224,14 +302,26 @@ class WebShopCatalog:
             }
             return engine.LuceneSearcher(str(catalog_directory / indexes[num_products]))
 
+        def load_products(filepath, num_products=None, human_goals=True):
+            return [], store, store.prices, {}
+
+        def get_goals(all_products, product_prices, human_goals=True):
+            return store.load_goals()
+
         engine.init_search_engine = init_search_engine  # ty: ignore[invalid-assignment]
         web_agent_text_env.init_search_engine = init_search_engine  # ty: ignore[invalid-assignment]
-        bootstrap = web_agent_text_env.WebAgentTextEnv(
-            observation_mode="text",
-            file_path=str(products),
-            human_goals=True,
-            session_prefix="bootstrap-",
-        )
+        web_agent_text_env.load_products = load_products  # ty: ignore[invalid-assignment]
+        web_agent_text_env.get_goals = get_goals  # ty: ignore[invalid-assignment]
+        try:
+            bootstrap = web_agent_text_env.WebAgentTextEnv(
+                observation_mode="text",
+                file_path=str(products),
+                human_goals=True,
+                session_prefix="bootstrap-",
+            )
+        except Exception:
+            store.close()
+            raise
         server = bootstrap.server
         server.user_sessions.pop(bootstrap.session, None)
         bootstrap.close()
@@ -506,6 +596,210 @@ async def rollout(args: argparse.Namespace, tasks: list[Task]) -> list[Trajector
                 traces=traces,
             )
     return traces
+
+
+def _open_catalog_store(
+    products: Path,
+    attributes: Path,
+    instructions: Path,
+    engine: Any,
+    goal: Any,
+) -> _CatalogStore:
+    db_path = products.parent / CATALOG_CACHE_FILE
+    fingerprint = _catalog_fingerprint(products, attributes, instructions)
+    store = _try_open_catalog_store(db_path, fingerprint)
+    if store is not None:
+        return store
+    lock_path = products.parent / f".{CATALOG_CACHE_FILE}.lock"
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        store = _try_open_catalog_store(db_path, fingerprint)
+        if store is not None:
+            return store
+        _build_catalog_db(db_path, fingerprint, products, attributes, instructions, engine, goal)
+    store = _try_open_catalog_store(db_path, fingerprint)
+    if store is None:
+        raise RuntimeError(f"Failed to initialize WebShop SQLite catalog cache at {db_path}")
+    return store
+
+
+def _try_open_catalog_store(db_path: Path, fingerprint: str) -> _CatalogStore | None:
+    if not db_path.is_file():
+        return None
+    store: _CatalogStore | None = None
+    try:
+        store = _CatalogStore(db_path)
+        if store.fingerprint() == fingerprint:
+            return store
+    except sqlite3.Error:
+        pass
+    if store is not None:
+        store.close()
+    return None
+
+
+def _build_catalog_db(
+    db_path: Path,
+    fingerprint: str,
+    products: Path,
+    attributes: Path,
+    instructions: Path,
+    engine: Any,
+    goal: Any,
+) -> None:
+    attributes_map = json.loads(attributes.read_text(encoding="utf-8"))
+    human_map = json.loads(instructions.read_text(encoding="utf-8"))
+    fd, tmp_name = tempfile.mkstemp(dir=db_path.parent, prefix=".catalog-", suffix=".sqlite3.tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    rng_state = random.getstate()
+    random.seed(233)
+    try:
+        conn = sqlite3.connect(tmp_path)
+        try:
+            conn.execute("PRAGMA synchronous = OFF")
+            conn.execute("PRAGMA journal_mode = OFF")
+            conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL)")
+            conn.execute("CREATE TABLE products (asin TEXT PRIMARY KEY, price REAL NOT NULL, data BLOB NOT NULL)")
+            asins: set[str] = set()
+            goal_items: list[dict[str, Any]] = []
+            goal_prices: dict[str, float] = {}
+            batch: list[tuple[str, float, bytes]] = []
+            for raw_item in _iter_json_array(products):
+                formatted = _format_product(raw_item, asins, attributes_map, human_map, engine)
+                if formatted is None:
+                    continue
+                asin, price, item = formatted
+                if "instructions" in item:
+                    goal_items.append(
+                        {
+                            "asin": asin,
+                            "category": item["category"],
+                            "query": item["query"],
+                            "name": item["name"],
+                            "product_category": item["product_category"],
+                            "instructions": item["instructions"],
+                        }
+                    )
+                    goal_prices[asin] = price
+                payload = zlib.compress(json.dumps(item, ensure_ascii=False).encode("utf-8"), level=1)
+                batch.append((asin, price, payload))
+                if len(batch) >= 5000:
+                    with conn:
+                        conn.executemany("INSERT INTO products VALUES (?, ?, ?)", batch)
+                    batch.clear()
+            if batch:
+                with conn:
+                    conn.executemany("INSERT INTO products VALUES (?, ?, ?)", batch)
+                batch.clear()
+            del attributes_map, human_map, asins
+            goals = goal.get_goals(goal_items, goal_prices, True)
+            goals_blob = zlib.compress(json.dumps(goals, ensure_ascii=False).encode("utf-8"), level=1)
+            with conn:
+                conn.executemany(
+                    "INSERT INTO meta VALUES (?, ?)",
+                    [("fingerprint", fingerprint.encode("utf-8")), ("goals", goals_blob)],
+                )
+        finally:
+            conn.close()
+        os.replace(tmp_path, db_path)
+    finally:
+        random.setstate(rng_state)
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+
+
+def _catalog_fingerprint(products: Path, attributes: Path, instructions: Path) -> str:
+    files = {}
+    for label, path in (("products", products), ("attributes", attributes), ("instructions", instructions)):
+        stat = path.stat()
+        files[label] = [stat.st_size, stat.st_mtime_ns]
+    return json.dumps({"version": 1, "files": files}, sort_keys=True)
+
+
+def _iter_json_array(path: Path, chunk_size: int = 1 << 22) -> Iterator[dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    with path.open(encoding="utf-8") as handle:
+        buffer = ""
+        pos = 0
+        while True:
+            chunk = handle.read(chunk_size)
+            if chunk:
+                buffer = buffer[pos:] + chunk
+                pos = 0
+            while True:
+                while pos < len(buffer) and buffer[pos] in " \t\r\n,[":
+                    pos += 1
+                if pos >= len(buffer) or buffer[pos] == "]":
+                    break
+                try:
+                    item, pos = decoder.raw_decode(buffer, pos)
+                except json.JSONDecodeError:
+                    if not chunk:
+                        raise
+                    break
+                yield item
+            if not chunk:
+                break
+
+
+def _format_product(
+    item: dict[str, Any],
+    asins: set[str],
+    attributes: dict[str, Any],
+    human_attributes: dict[str, Any],
+    engine: Any,
+) -> tuple[str, float, dict[str, Any]] | None:
+    engine.clean_product_keys([item])
+    asin = item["asin"]
+    if asin == "nan" or len(asin) > 10 or asin in asins:
+        return None
+    asins.add(asin)
+    item["Title"] = item["name"]
+    item["Description"] = item["full_description"]
+    item["Reviews"] = []
+    item["Rating"] = "N.A."
+    small = item["small_description"]
+    item["BulletPoints"] = small if isinstance(small, list) else [small]
+    raw_pricing = item.get("pricing")
+    if not raw_pricing:
+        pricing = [100.0]
+        price_tag = "$100.0"
+    else:
+        pricing = [float(Decimal(re.sub(r"[^\d.]", "", price))) for price in raw_pricing.split("$")[1:]]
+        if len(pricing) == 1:
+            price_tag = f"${pricing[0]}"
+        else:
+            price_tag = f"${pricing[0]} to ${pricing[1]}"
+            pricing = pricing[:2]
+    item["pricing"] = pricing
+    item["Price"] = price_tag
+    options: dict[str, list[str]] = {}
+    option_to_image: dict[str, Any] = {}
+    customization_options = item["customization_options"]
+    if customization_options:
+        for option_name, option_contents in customization_options.items():
+            if option_contents is None:
+                continue
+            option_key = option_name.lower()
+            option_values = []
+            for option_content in option_contents:
+                option_value = option_content["value"].strip().replace("/", " | ").lower()
+                option_values.append(option_value)
+                option_to_image[option_value] = option_content.get("image", None)
+            options[option_key] = option_values
+    item["options"] = options
+    item["option_to_image"] = option_to_image
+    if asin in attributes and "attributes" in attributes[asin]:
+        item["Attributes"] = attributes[asin]["attributes"]
+    else:
+        item["Attributes"] = ["DUMMY_ATTR"]
+    if asin in human_attributes:
+        item["instructions"] = human_attributes[asin]
+    item["MainImage"] = item["images"][0]
+    item["query"] = item["query"].lower().strip()
+    price = 100.0 if not pricing else (pricing[0] if len(pricing) == 1 else random.uniform(*pricing[:2]))
+    return asin, price, item
 
 
 @contextmanager

@@ -380,6 +380,105 @@ class WebShopEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         catalog.close()
         self.assertEqual(gc.get_freeze_count(), baseline)
 
+    def test_sqlite_catalog_store_caches_products_prices_and_rebuilds_on_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            variant = root / "full"
+            variant.mkdir()
+            products = variant / "products.json"
+            attributes = root / "product_attributes.json"
+            instructions = root / "human_instructions.json"
+            products.write_text(
+                json.dumps(
+                    [
+                        {
+                            "asin": "B000000001",
+                            "name": "Trail Running Shoes",
+                            "full_description": "Lightweight breathable mesh shoes.",
+                            "small_description": ["Mesh upper", "Rubber sole"],
+                            "pricing": "$40.0 to $60.0",
+                            "images": ["https://example.com/shoe.jpg"],
+                            "product_category": "Clothing › Shoes",
+                            "category": "shoes",
+                            "query": "  Running Shoes ",
+                            "customization_options": {
+                                "Size": [{"value": " 9/Wide ", "image": "https://example.com/s9.jpg"}]
+                            },
+                            "brand": "dropped",
+                        },
+                        {
+                            "asin": "B000000001",
+                            "name": "Duplicate ignored",
+                            "full_description": "",
+                            "small_description": "",
+                            "pricing": "$10.0",
+                            "images": ["https://example.com/dup.jpg"],
+                            "product_category": "Clothing",
+                            "category": "shoes",
+                            "query": "shoes",
+                            "customization_options": "",
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            attributes.write_text(
+                json.dumps({"B000000001": {"attributes": ["lightweight", "breathable"]}}),
+                encoding="utf-8",
+            )
+            instructions.write_text(
+                json.dumps(
+                    {
+                        "B000000001": [
+                            {
+                                "instruction": "Find trail running shoes.",
+                                "instruction_attributes": ["lightweight"],
+                                "instruction_options": ["9 | wide"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            engine = Namespace(clean_product_keys=lambda items: [item.pop("brand", None) for item in items])
+            goal = Namespace(
+                get_goals=lambda items, prices, _human: [
+                    {"asin": item["asin"], "price": prices[item["asin"]]} for item in items
+                ]
+            )
+            store = ws._open_catalog_store(products, attributes, instructions, engine, goal)
+            try:
+                self.assertEqual(len(store), 1)
+                self.assertIn("B000000001", store)
+                self.assertNotIn("UNKNOWN", store)
+                item = store["B000000001"]
+                self.assertNotIn("brand", item)
+                self.assertEqual(item["Title"], "Trail Running Shoes")
+                self.assertEqual(item["Price"], "$40.0 to $60.0")
+                self.assertEqual(item["options"], {"size": ["9 | wide"]})
+                self.assertEqual(item["Attributes"], ["lightweight", "breathable"])
+                self.assertEqual(item["query"], "running shoes")
+                self.assertGreaterEqual(store.prices["B000000001"], 40.0)
+                self.assertLessEqual(store.prices["B000000001"], 60.0)
+                self.assertEqual(store.load_goals(), [{"asin": "B000000001", "price": store.prices["B000000001"]}])
+            finally:
+                store.close()
+
+            with patch.object(ws, "_build_catalog_db") as rebuild:
+                reused = ws._open_catalog_store(products, attributes, instructions, engine, goal)
+                reused.close()
+                rebuild.assert_not_called()
+
+            attributes.write_text(
+                json.dumps({"B000000001": {"attributes": ["updated"]}}),
+                encoding="utf-8",
+            )
+            rebuilt = ws._open_catalog_store(products, attributes, instructions, engine, goal)
+            try:
+                self.assertEqual(rebuilt["B000000001"]["Attributes"], ["updated"])
+            finally:
+                rebuilt.close()
+
     async def test_sequential_calls_stop_on_buy_and_request_final_without_tools(self):
         env, task = _shop_env(turns=5)
         calls = [
