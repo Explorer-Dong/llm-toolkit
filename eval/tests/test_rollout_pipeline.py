@@ -141,6 +141,36 @@ class RolloutPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.call_args.kwargs["model"], "deepseek-flash")
         self.assertEqual(json.loads((run_dir / "config.json").read_text())["model"], "deepseek-v4.1-flash-1017")
 
+    async def test_resume_deepseek_flash_restores_api_name_and_accepts_alias(self):
+        self.args.output_dir = None
+        self.args.model = "deepseek-flash"
+        output = Path(self.temporary.name) / "outputs"
+        with (
+            patch.object(resume, "OUTPUT_DIR", output),
+            patch.object(aime_rollout, "make_client", return_value=self.client),
+            patch.object(agent, "call_model", return_value=AssistantTurn("answer")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            await aime_rollout.rollout(self.args, self.tasks[:2])
+        run_dir = next((output / "aime").iterdir())
+        trajectory_path(run_dir, self.tasks[1].id).unlink()
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(aime_rollout, "load_dotenv"):
+            restored = aime_rollout.parse_args(["--resume", str(run_dir)])
+            explicit = aime_rollout.parse_args(["--resume", str(run_dir), "--model", "deepseek-flash"])
+        self.assertEqual(restored.model, "deepseek-flash")
+        self.assertEqual(explicit.model, "deepseek-flash")
+
+        resumed_args = argparse.Namespace(**(vars(self.args) | {"resume": run_dir}))
+        with (
+            patch.object(aime_rollout, "make_client", return_value=self.client),
+            patch.object(agent, "call_model", return_value=AssistantTurn("answer")) as call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            await aime_rollout.rollout(resumed_args, self.tasks[:2])
+        self.assertEqual(call.call_args.kwargs["model"], "deepseek-flash")
+        self.assertEqual(json.loads((run_dir / "config.json").read_text())["model"], "deepseek-v4.1-flash-1017")
+
     async def test_envs_are_per_sample_and_collect_runs_before_teardown(self):
         self.args.benchmark = "swe_bench"
         events = []

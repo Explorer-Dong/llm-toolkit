@@ -84,6 +84,35 @@ class ScoreEnvironmentOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.call_args.kwargs["model"], "deepseek-flash")
         self.assertEqual(json.loads((output / "config.json").read_text())["judge_model"], "deepseek-v4.1-flash-1017")
 
+    async def test_resume_deepseek_flash_restores_api_judge_model_and_accepts_alias(self):
+        _write_run(self.run_dir, benchmark="browsecomp")
+        client = MagicMock(close=AsyncMock())
+        with (
+            patch.object(browsecomp, "load_tasks", side_effect=_load_tasks),
+            patch.object(browsecomp, "make_client", return_value=client),
+            patch.object(browsecomp, "call_model", return_value=AssistantTurn("correct: yes")),
+        ):
+            score_dir, _ = await browsecomp.run_score(_score_args(self.run_dir, judge_model="deepseek-flash"))
+        records = json.loads((score_dir / "trajectories.json").read_text())
+        records[0]["score_result"]["sys_error"] = "retry"
+        (score_dir / "trajectories.json").write_text(json.dumps(records))
+
+        with patch.dict(os.environ, {}, clear=True), patch.object(browsecomp, "load_dotenv"):
+            restored = browsecomp.parse_args(["--resume", str(score_dir)])
+            explicit = browsecomp.parse_args(["--resume", str(score_dir), "--judge-model", "deepseek-flash"])
+        self.assertEqual(restored.judge_model, "deepseek-flash")
+        self.assertEqual(explicit.judge_model, "deepseek-flash")
+
+        with (
+            patch.object(browsecomp, "load_tasks", side_effect=_load_tasks),
+            patch.object(browsecomp, "make_client", return_value=client),
+            patch.object(browsecomp, "call_model", return_value=AssistantTurn("correct: yes")) as call,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            await browsecomp.run_score(_score_args(None, resume=score_dir, judge_model="deepseek-flash"))
+        self.assertEqual(call.call_args.kwargs["model"], "deepseek-flash")
+        self.assertEqual(json.loads((score_dir / "config.json").read_text())["judge_model"], "deepseek-v4.1-flash-1017")
+
     async def test_wrong_benchmark_is_rejected_before_grading(self):
         evaluate = AsyncMock()
         with (

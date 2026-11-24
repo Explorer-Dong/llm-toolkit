@@ -38,6 +38,7 @@ __all__ = [
 
 SECRET_KEYS = {"api_key", "serper_api_key", "crawl4ai_token", "ds_tool_key", "judge_api_key"}
 MODEL_NAMES = {"deepseek-flash": "deepseek-v4.1-flash-1017"}
+_API_MODEL_NAMES = {persisted: api for api, persisted in MODEL_NAMES.items()}
 ROLLOUT_OVERRIDABLE = frozenset(
     {
         "base_url",
@@ -212,6 +213,8 @@ def restore_resume_args(
             setattr(args, key, str(resolve_dataset_file(saved_value, package_dir)))
         elif is_path and saved_value is not None:
             setattr(args, key, Path(saved_value))
+        elif key in {"model", "judge_model"}:
+            setattr(args, key, explicit[key] if key in explicit else _api_model(saved_value))
         else:
             setattr(args, key, saved_value)
     return explicit
@@ -266,7 +269,7 @@ def init_rollout_dir(
             raise ValueError("Dataset selection does not match the rollout sample ids")
         if bool(saved_config.get("collect_environment_outputs")) != collect_enabled:
             raise ValueError("Collection mode does not match the saved rollout config")
-        if saved_config.get("model") != args.model:
+        if saved_config.get("model") != MODEL_NAMES.get(args.model, args.model):
             raise ValueError(f"Model {args.model!r} does not match saved model {saved_config.get('model')!r}")
         if (
             "dataset_file" in saved_config
@@ -452,10 +455,7 @@ def init_score_dir(
 
     score_config = {key: value for key, value in vars(args).items() if key not in SECRET_KEYS and key != "resume"}
     if "judge_model" in score_config:
-        judge = score_config["judge_model"]
-        score_config["judge_model"] = (
-            [MODEL_NAMES.get(m, m) for m in judge] if isinstance(judge, list) else MODEL_NAMES.get(judge, judge)
-        )
+        score_config["judge_model"] = _canonical_model(score_config["judge_model"])
     if saved_score_config is not None and "output_dir" in saved_score_config:
         score_config["output_dir"] = saved_score_config["output_dir"]
     score_config.update(
@@ -529,11 +529,29 @@ def _resume_values_match(
     package_dir: Path,
     is_path: bool,
 ) -> bool:
+    if key in {"model", "judge_model"}:
+        return _canonical_model(current) == _canonical_model(saved_value)
     if key == "dataset_file" and saved_value is not None and current is not None:
         return Path(current).resolve() == resolve_dataset_file(saved_value, package_dir)
     if is_path and saved_value is not None and current is not None:
         return Path(current).resolve() == Path(saved_value).resolve()
     return current == saved_value
+
+
+def _canonical_model(value: Any) -> Any:
+    if isinstance(value, list):
+        return [MODEL_NAMES.get(item, item) for item in value]
+    if isinstance(value, str):
+        return MODEL_NAMES.get(value, value)
+    return value
+
+
+def _api_model(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_API_MODEL_NAMES.get(item, item) for item in value]
+    if isinstance(value, str):
+        return _API_MODEL_NAMES.get(value, value)
+    return value
 
 
 def _explicit_cli_args(parser: argparse.ArgumentParser, argv: Sequence[str] | None) -> dict[str, Any]:
